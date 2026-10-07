@@ -15,6 +15,8 @@
 """Operations used by Grain"""
 
 import dataclasses
+import os
+import re
 import warnings
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
@@ -34,6 +36,7 @@ from maxtext.multimodal import processor as mm_processor
 from maxtext.multimodal import utils as mm_utils
 from maxtext.utils import gcs_utils
 from maxtext.utils import max_logging
+from transformers.utils import chat_template_utils
 
 Features = dict[str, Any]
 INPUT_TOKENS_KEY = "input_ids"
@@ -264,6 +267,76 @@ def _assistant_span_is_clean(messages, message_idx, rendered, span_text):
   return not any(m.get("content") and m["content"] in tail for m in messages[message_idx + 1 :])
 
 
+def _segments_from_spans(full_tokens, spans):
+  """(token ids, is_prompt) runs covering `full_tokens`, with the token ranges in `spans` trained."""
+  segments = []
+  pos = 0
+  for start, end in spans:
+    start = max(start, pos)
+    if start > pos:
+      segments.append((list(full_tokens[pos:start]), True))
+    if end > start:
+      segments.append((list(full_tokens[start:end]), False))
+    pos = max(pos, end)
+  if pos < len(full_tokens):
+    segments.append((list(full_tokens[pos:]), True))
+  return segments
+
+
+_GENERATION_BLOCK = re.compile(r"\{%[-+]?\s*generation\s*[-+]?%\}")
+
+
+def _generation_block_segments(tokenizer_model, conversation, template):
+  """Segments for templates that mark assistant output with `{% generation %}` blocks, as open-instruct labels
+  them: render once with the generation character ranges, tokenize the rendering with offsets, and train every
+  token that overlaps a range (boundary merges included, zero-width offsets never). A conversation whose
+  end-of-turn or end-of-sequence token sits just outside its block is not trained (open-instruct drops it)."""
+  rendered_chats, generation_indices = chat_template_utils.render_jinja_template(
+      conversations=[conversation],
+      chat_template=template,
+      return_assistant_tokens_mask=True,
+      add_generation_prompt=False,
+      **tokenizer_model.special_tokens_map,
+  )
+  rendered, ranges = rendered_chats[0], [tuple(r) for r in generation_indices[0]]
+  enc = tokenizer_model(rendered, add_special_tokens=False, return_offsets_mapping=True)
+  full_tokens, offsets = enc["input_ids"], np.asarray(enc["offset_mapping"]).reshape(-1, 2)
+  if not any(start < end for start, end in ranges):
+    return [(list(full_tokens), True)] if any(m["role"] == "assistant" for m in conversation) else []
+  terminators = {t for t in (tokenizer_model.eos_token, "<|im_end|>") if t}
+  for start, end in ranges:
+    if start == end:
+      continue
+    t0 = end
+    while t0 < len(rendered) and rendered[t0].isspace():
+      t0 += 1
+    for terminator in terminators:
+      if rendered.startswith(terminator, t0):
+        covered = t0
+        for b0, b1 in sorted(ranges):
+          if b0 <= covered < b1:
+            covered = b1
+        if covered < t0 + len(terminator):
+          max_logging.log(f"Not training on a conversation whose {terminator!r} sits outside its generation block.")
+          return [(list(full_tokens), True)]
+  trained = np.zeros(len(full_tokens), dtype=bool)
+  for start, end in ranges:
+    if start < end:
+      trained |= (offsets[:, 1] > start) & (offsets[:, 0] < end)
+  trained &= offsets[:, 0] < offsets[:, 1]
+  spans, i = [], 0
+  while i < len(trained):
+    if trained[i]:
+      j = i
+      while j < len(trained) and trained[j]:
+        j += 1
+      spans.append((i, j))
+      i = j
+    else:
+      i += 1
+  return _segments_from_spans(full_tokens, spans)
+
+
 def _split_conversation_into_segments(tokenizer_model, conversation):
   """Splits a conversation into formatted (text, is_prompt) segments covering its whole rendering.
 
@@ -285,8 +358,18 @@ def _split_conversation_into_segments(tokenizer_model, conversation):
     conversation: The messages of one conversation.
 
   Returns:
-    A list of (text, is_prompt) pairs.
+    A list of (token ids, is_prompt) pairs. Token ids, not text: re-tokenizing a decoded slice need not give the
+    same tokens back.
   """
+
+  # Which labelling rule to follow is the recipe's, not the template's: open-instruct main labels
+  # `{% generation %}` blocks (allenai/open-instruct#1879), while older branches (e.g. the Olmo 3.5 hero SFT
+  # runs) derive spans from rendered prefixes even when the template has blocks. They differ on templates whose
+  # generation prompt ends inside the block, e.g. Olmo 3.5's trailing <think>.
+  template = tokenizer_model.get_chat_template()
+  use_blocks = os.environ.get("MAXTEXT_SFT_LABELS", "generation_blocks") == "generation_blocks"
+  if use_blocks and isinstance(template, str) and _GENERATION_BLOCK.search(template):
+    return _generation_block_segments(tokenizer_model, conversation, template)
 
   def n_tokens(messages, add_generation_prompt):
     return len(
@@ -335,22 +418,11 @@ def _split_conversation_into_segments(tokenizer_model, conversation):
         and not _assistant_span_is_clean(conversation, idx, rendered, decode(full_tokens[start:end]))
     ):
       max_logging.log(f"Not training on a conversation whose assistant span {idx} does not match its content.")
-      return [(decode(full_tokens), True)]
+      return [(list(full_tokens), True)]
     spans.append((start, end))
   if not spans:
     return []
-  segments = []
-  pos = 0
-  for start, end in spans:
-    start = max(start, pos)
-    if start > pos:
-      segments.append((decode(full_tokens[pos:start]), True))
-    if end > start:
-      segments.append((decode(full_tokens[start:end]), False))
-    pos = max(pos, end)
-  if pos < len(full_tokens):
-    segments.append((decode(full_tokens[pos:]), True))
-  return segments
+  return _segments_from_spans(full_tokens, spans)
 
 
 def apply_chat_template(example, tokenizer_model, data_column_name):
@@ -393,7 +465,8 @@ def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
   for column_name in column_names:
     if isinstance(example[column_name], list):
       example[column_name] = [
-          hf_tokenizer(x, truncation=truncation, max_length=max_length)["input_ids"] for x in example[column_name]
+          x if not isinstance(x, str) else hf_tokenizer(x, truncation=truncation, max_length=max_length)["input_ids"]
+          for x in example[column_name]
       ]
     elif isinstance(example[column_name], str):
       example[column_name] = hf_tokenizer(example[column_name], truncation=truncation, max_length=max_length)["input_ids"]
