@@ -251,51 +251,70 @@ def extract_token_ids(tokens):
     raise ValueError(f"Can't extract token_ids from type {type(tokens)}")
 
 
-def _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs):
-  """Splits a conversational round (system + user + assistant) into prompt and completion formatted strings.
+def _common_prefix_len(a, b):
+  n = 0
+  for x, y in zip(a, b):
+    if x != y:
+      break
+    n += 1
+  return n
 
-  Uses the longest-common-prefix between the full conversation tokens and the
-  generation-prompt tokens to locate where the prompt ends and completion begins.
+
+def _split_conversation_into_prompts_and_completions(tokenizer_model, conversation):
+  """Splits a conversation into alternating prompt and completion formatted strings.
+
+  The conversation is templated once, as a whole, and every segment is cut from that rendering, so
+  turns appear exactly as the chat template renders the full conversation: one system prompt, and
+  each earlier assistant turn closed the way the template closes a turn that is followed by more
+  messages (which can differ from how it closes the last turn, e.g. end-of-turn vs end-of-sequence).
+
+  Each assistant turn's completion starts where the generation prompt for that turn ends (the
+  longest common prefix of the full rendering and the rendering of the preceding messages with
+  `add_generation_prompt=True`) and ends where a rendering truncated after that turn ends.
 
   Args:
     tokenizer_model: The tokenizer instance.
-    round_msgs: Messages for the current conversational turn including the assistant response.
+    conversation: Messages through the last assistant response.
 
   Returns:
-    A tuple of (prompt_str, completion_str).
+    A list of (prompt_str, completion_str) pairs, one per assistant turn.
   """
   full_tokens = extract_token_ids(
-      tokenizer_model.apply_chat_template(round_msgs, add_generation_prompt=False, tokenize=True)
+      tokenizer_model.apply_chat_template(conversation, add_generation_prompt=False, tokenize=True)
   )
-  prompt_tokens = extract_token_ids(
-      tokenizer_model.apply_chat_template(round_msgs[:-1], add_generation_prompt=True, tokenize=True)
-  )
-
-  # Find the longest common prefix where prompt ends and completion begins
-  common_len = 0
-  for full_id, prompt_id in zip(full_tokens, prompt_tokens):
-    if full_id == prompt_id:
-      common_len += 1
-    else:
-      break
-
-  if common_len == 0:
-    raise ValueError(
-        "Chat template generation prompt mismatch: no common prefix tokens found.\n"
-        f"Full conversation tokens: {full_tokens} ('{tokenizer_model.decode(full_tokens)}')\n"
-        f"Generation prompt tokens: {prompt_tokens} ('{tokenizer_model.decode(prompt_tokens)}')\n"
-        "Cannot determine completion boundary."
+  segments = []
+  emitted = 0
+  for idx, message in enumerate(conversation):
+    if message["role"] != "assistant":
+      continue
+    prompt_tokens = extract_token_ids(
+        tokenizer_model.apply_chat_template(conversation[:idx], add_generation_prompt=True, tokenize=True)
     )
-
-  prompt_str = tokenizer_model.decode(full_tokens[:common_len], skip_special_tokens=False)
-  completion_str = tokenizer_model.decode(full_tokens[common_len:], skip_special_tokens=False)
-  return prompt_str, completion_str
-
-
-def _get_completion_in_chat_template(tokenizer_model, round_msgs):
-  """Calculates the completion part of a conversation turn formatted with a chat template."""
-  _, completion_str = _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs)
-  return completion_str
+    prompt_end = _common_prefix_len(full_tokens, prompt_tokens)
+    if prompt_end == 0:
+      raise ValueError(
+          "Chat template generation prompt mismatch: no common prefix tokens found.\n"
+          f"Full conversation tokens: {full_tokens} ('{tokenizer_model.decode(full_tokens)}')\n"
+          f"Generation prompt tokens: {prompt_tokens} ('{tokenizer_model.decode(prompt_tokens)}')\n"
+          "Cannot determine completion boundary."
+      )
+    turn_tokens = extract_token_ids(
+        tokenizer_model.apply_chat_template(conversation[: idx + 1], add_generation_prompt=False, tokenize=True)
+    )
+    turn_end = len(turn_tokens)
+    # The truncated rendering may close the turn differently, but only in its final token.
+    if prompt_end < emitted or turn_end <= prompt_end or turn_end > len(full_tokens):
+      raise ValueError(f"Chat template renders the conversation inconsistently around message {idx}.")
+    if _common_prefix_len(full_tokens, turn_tokens) < turn_end - 1:
+      raise ValueError(f"Chat template renders the conversation inconsistently around message {idx}.")
+    segments.append(
+        (
+            tokenizer_model.decode(full_tokens[emitted:prompt_end], skip_special_tokens=False),
+            tokenizer_model.decode(full_tokens[prompt_end:turn_end], skip_special_tokens=False),
+        )
+    )
+    emitted = turn_end
+  return segments
 
 
 def apply_chat_template(example, tokenizer_model, data_column_name):
@@ -319,29 +338,22 @@ def apply_chat_template(example, tokenizer_model, data_column_name):
         prompt (if applicable). `False` indicates the expected LLM
         completion, excluding the assistant's start tokens.
   """
-  messages = []
-  is_prompt = []
-  round_msgs = []
+  conversation = list(example[data_column_name])
   try:
-    for idx, message in enumerate(example[data_column_name]):
-      if message["role"] == "system":
-        if idx != 0:
-          raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
-        round_msgs.append(message)
-      elif message["role"] == "user":
-        round_msgs.append(message)
-      elif message["role"] == "assistant":
-        round_msgs.append(message)
-        prompt_str, completion_str = _split_turn_into_prompt_and_completion(tokenizer_model, round_msgs)
-        messages.extend([prompt_str, completion_str])
-        is_prompt.extend([True, False])
-        # Round ended, clearing the buffer.
-        round_msgs.clear()
+    for idx, message in enumerate(conversation):
+      if message["role"] == "system" and idx != 0:
+        raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
+    last_assistant = max((i for i, m in enumerate(conversation) if m["role"] == "assistant"), default=-1)
+    segments = (
+        _split_conversation_into_prompts_and_completions(tokenizer_model, conversation[: last_assistant + 1])
+        if last_assistant >= 0
+        else []
+    )
   except ValueError as e:
     max_logging.log(f"Unable to apply chat template: {e}")
     raise e
-  example["is_prompt"] = is_prompt
-  example[data_column_name] = messages
+  example["is_prompt"] = [flag for _ in segments for flag in (True, False)]
+  example[data_column_name] = [text for pair in segments for text in pair]
   return example
 
 
