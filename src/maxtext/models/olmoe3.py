@@ -219,6 +219,13 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       else:
         prev_ids = jnp.pad(decoder_segment_ids, ((0, 0), (1, 0)), constant_values=-1)[:, :seq_len]
         resets = decoder_segment_ids != prev_ids
+        # Padding (segment id 0) takes no part in the recurrence: no decay and no state update. Its gates are
+        # arbitrary, and a chunk made only of padding can push the unfused chunk's decay exponents past the float
+        # range; the inf * 0 = NaN that follows reaches real tokens through the loss's 0-weighted terms and the
+        # dense MoE dispatch. Padding outputs are never trained, so real tokens are unchanged.
+        is_pad = (decoder_segment_ids == 0)[:, :, None]
+        log_decay = jnp.where(is_pad[..., None], 0.0, log_decay)
+        beta = jnp.where(is_pad, 0.0, beta)
 
       chunk = self.config.gdn_chunk_size
       if chunk > 0 and seq_len % chunk == 0:
