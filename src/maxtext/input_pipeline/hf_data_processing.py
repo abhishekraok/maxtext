@@ -298,16 +298,16 @@ def vision_sft_preprocessing_pipeline(
   return multihost_gen
 
 
-def local_rows_trained(config, global_mesh, global_batch_size_to_load, max_target_length):
+def local_rows_trained(config, global_mesh, rows_per_batch, cutoff, max_target_length):
   """Which of this host's loaded rows the loss trains on, in local batch order; None if it trains on all of them.
 
-  With per_device_batch_size < 1 every device still loads a row, but the loss keeps only the first
-  global_batch_size_to_train_on rows of the global batch (pre_train/train.py loss_fn). A host that loads real data can
-  own rows on both sides of that cutoff; the rows past it would be packed from the stream and then dropped, so the
-  stream would be consumed faster than it is trained on. Local row i goes to
+  With per_device_batch_size < 1 every device still loads a row, but the loss keeps only the first `cutoff` rows of
+  each global batch of `rows_per_batch` (pre_train/train.py loss_fn: micro_batch_size_to_train_on). A host that loads
+  real data can own rows on both sides of that cutoff; the rows past it would be packed from the stream and then
+  dropped, so the stream would be consumed faster than it is trained on. Local row i goes to
   global_mesh.local_devices[i // rows_per_device] (multihost_dataloading._form_global_array).
   """
-  cutoff = config.global_batch_size_to_train_on
+  global_batch_size_to_load = rows_per_batch
   if cutoff >= global_batch_size_to_load:
     return None
   pspec = remove_size_one_mesh_axis(jax.sharding.PartitionSpec(*config.data_sharding), global_mesh)
@@ -368,8 +368,13 @@ def preprocessing_pipeline(
   else:
     batch_size = local_batch_size
   keep_rows = None
-  if not use_tunix_gradient_accumulation and not config.elastic_enabled:
-    keep_rows = local_rows_trained(config, global_mesh, global_batch_size, max_target_length)
+  # Each loaded batch is one microbatch under Tunix gradient accumulation, a full step otherwise; native accumulation
+  # splits a loaded batch inside the step and is left alone.
+  if not config.elastic_enabled and (use_tunix_gradient_accumulation or num_microbatches == 1):
+    micro = num_microbatches if use_tunix_gradient_accumulation else 1
+    keep_rows = local_rows_trained(
+        config, global_mesh, global_batch_size // micro, config.micro_batch_size_to_train_on, max_target_length
+    )
     if keep_rows is not None:
       assert len(keep_rows) == batch_size, (len(keep_rows), batch_size)
       max_logging.log(f"Host loads {sum(keep_rows)} of its {batch_size} rows; the loss drops the others.")
