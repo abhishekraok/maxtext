@@ -892,6 +892,27 @@ class ReformatPacking(grain.MapTransform):
 
 
 @dataclasses.dataclass
+class ExpandToLoadedRows(grain.MapTransform):
+  """Place a batch of the trained rows at their positions in the loaded batch; the other rows are zeros.
+
+  Zero rows have zero segmentation, so they carry no loss weight; the loss slices them off anyway.
+  """
+
+  def __init__(self, keep):
+    self.keep = np.asarray(keep, dtype=bool)
+
+  def map(self, element):
+    out = {}
+    for k, v in element.items():
+      v = np.asarray(v)
+      assert v.shape[0] == self.keep.sum(), (k, v.shape, int(self.keep.sum()))
+      full = np.zeros((len(self.keep),) + v.shape[1:], dtype=v.dtype)
+      full[self.keep] = v
+      out[k] = full
+    return out
+
+
+@dataclasses.dataclass
 class PadOrTrimToMaxLength(grain.MapTransform):
   """Pads or trims each input to the specified length.
   And optionally add true length for the input."""
