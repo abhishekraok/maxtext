@@ -227,6 +227,14 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
         log_decay = jnp.where(is_pad[..., None], 0.0, log_decay)
         beta = jnp.where(is_pad, 0.0, beta)
 
+      # The recurrence runs along the sequence, so it must see the whole sequence. Left to propagation, a
+      # context-sharded sequence shards the scan's chunk axis, and XLA all-gathers every chunk's inputs on each
+      # scan iteration (quadratic traffic: 90% of a 64K step at context 2). Gather once per layer instead.
+      seq_whole = ("activation_batch", None, "activation_heads", None)
+      q, k, v, log_decay = (nn.with_logical_constraint(t, seq_whole) for t in (q, k, v, log_decay))
+      beta = nn.with_logical_constraint(beta, seq_whole[:3])
+      resets = nn.with_logical_constraint(resets, seq_whole[:2])
+
       chunk = self.config.gdn_chunk_size
       if chunk > 0 and seq_len % chunk == 0:
         out = _delta_rule_chunked(
@@ -234,8 +242,9 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
         )
       else:
         out = _delta_rule_scan(q, k, v.astype(jnp.float32), jnp.exp(log_decay), beta, resets)
+      out = nn.with_logical_constraint(out, ("activation_batch", "activation_length", "activation_heads", None))
 
-    gate = jax.nn.sigmoid(self.g_proj_2(self.g_proj_1(x)).reshape(batch, seq_len, heads, dv))
+    gate =jax.nn.sigmoid(self.g_proj_2(self.g_proj_1(x)).reshape(batch, seq_len, heads, dv))
     out = self.o_norm(out.astype(x.dtype)) * gate
     return self.w_out(out.reshape(batch, seq_len, heads * dv))
 
