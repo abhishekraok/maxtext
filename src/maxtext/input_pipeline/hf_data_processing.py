@@ -91,7 +91,10 @@ def _get_training_objective_transform(
   if objective != "causal_lm":
     raise ValueError(f"Unsupported training objective: {objective}")
   if shift and not use_dpo:
-    return input_pipeline_utils.ShiftData(ignored_ids=[pad_id, bos_token_id], axis=1)
+    # A BOS target only marks the next packed document, so it carries no loss. Pass bos_token_id=None when BOS is
+    # also EOS (Olmo, GPT-2 style): ignoring it would also drop every EOS target, and the model never learns to stop.
+    ignored = [pad_id] if bos_token_id is None else [pad_id, bos_token_id]
+    return input_pipeline_utils.ShiftData(ignored_ids=ignored, axis=1)
   return None
 
 
@@ -503,7 +506,7 @@ def preprocessing_pipeline(
       use_sft=use_sft,
       packing=packing,
       pad_id=pad_id,
-      bos_token_id=tokenizer.bos_token_id,
+      bos_token_id=None if tokenizer.bos_token_id == tokenizer.eos_token_id else tokenizer.bos_token_id,
   )
   if target_transform is not None:
     operations.append(target_transform)
