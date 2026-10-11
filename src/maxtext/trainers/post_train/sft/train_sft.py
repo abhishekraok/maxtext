@@ -98,7 +98,7 @@ class MaxTextPeftTrainer(peft_trainer.PeftTrainer):
         for x in (aux["xent_sum"], aux["total_weights"], aux["z_loss"], aux["moe_lb_loss"])
     )
     ce = xent_sum / (weights + 1e-8) - z  # xent_sum includes the z-loss term
-    max_logging.log(f"LOSS-PARTS step={self._train_steps + 1} ce={ce:.6f} moe_lb={lb:.6f} z={z:.6f}")
+    max_logging.log(f"LOSS-PARTS step={self._train_steps + 1} ce={ce:.6f} moe_lb={lb:.6f} z={z:.6f} tokens={weights:.0f}")
     if "moe_required_rbf" in aux:
       # log_required_ragged_buffer_factor: per MoE layer, the smallest ragged_buffer_factor that would not have
       # dropped a token this step; at or below the run's factor, the step dropped nothing.
