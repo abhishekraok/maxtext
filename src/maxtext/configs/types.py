@@ -1538,7 +1538,7 @@ class Qwen3Next(BaseModel):
   )
   kda_matmul_precision: Literal["default", "high", "highest"] = Field(
       "default",
-      description="jax.default_matmul_precision for the sub-block KDA path (kda_chunked_impl=subblock).",
+      description="jax.default_matmul_precision for the chunked KDA paths (pairwise and subblock).",
   )
   kda_sub_block: int = Field(
       16,

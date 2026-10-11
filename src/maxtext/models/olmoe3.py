@@ -251,8 +251,7 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       chunk = self.config.gdn_chunk_size
       if chunk > 0 and seq_len % chunk == 0:
         if self.config.kda_chunked_impl == "subblock":
-          # On TPU, "default" runs f32 matmuls as bf16 passes; the sub-block factorization and the block-doubling
-          # inverse then cost ~0.005 nats of CE against the pairwise path (equal on CPU). "highest" restores it.
+          # On TPU, "default" runs f32 matmuls as bf16 passes (kda_matmul_precision applies to both chunked paths).
           with jax.default_matmul_precision(self.config.kda_matmul_precision):
             out = _delta_rule_chunked_subblock(
                 q,
@@ -267,7 +266,8 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
                 state_scan=self._pallas_state_scan if self.config.kda_pallas_scan else None,
             )
         else:
-          out = _delta_rule_chunked(q, k, v.astype(jnp.float32), log_decay, beta, resets, chunk, self.config.gdn_state_dtype)
+          with jax.default_matmul_precision(self.config.kda_matmul_precision):
+            out = _delta_rule_chunked(q, k, v.astype(jnp.float32), log_decay, beta, resets, chunk, self.config.gdn_state_dtype)
       else:
         out = _delta_rule_scan(q, k, v.astype(jnp.float32), jnp.exp(log_decay), beta, resets)
       out = nn.with_logical_constraint(out, ("activation_batch", "activation_length", "activation_heads", None))
