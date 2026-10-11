@@ -228,6 +228,7 @@ def get_tunix_config(mt_config):
   checkpointing_options = ocp.CheckpointManagerOptions(
       save_interval_steps=mt_config.checkpoint_period,
       enable_async_checkpointing=mt_config.async_checkpointing,
+      max_to_keep=mt_config.max_num_checkpoints_to_keep,
   )
 
   # Metrics configurations
