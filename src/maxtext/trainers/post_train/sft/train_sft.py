@@ -40,6 +40,7 @@ from typing import Any, Sequence
 from absl import app
 import os
 import jax
+import numpy as np
 import jax.numpy as jnp
 import optax
 import pathwaysutils
@@ -98,6 +99,14 @@ class MaxTextPeftTrainer(peft_trainer.PeftTrainer):
     )
     ce = xent_sum / (weights + 1e-8) - z  # xent_sum includes the z-loss term
     max_logging.log(f"LOSS-PARTS step={self._train_steps + 1} ce={ce:.6f} moe_lb={lb:.6f} z={z:.6f}")
+    if "moe_required_rbf" in aux:
+      # log_required_ragged_buffer_factor: per MoE layer, the smallest ragged_buffer_factor that would not have
+      # dropped a token this step; at or below the run's factor, the step dropped nothing.
+      rbf = aux["moe_required_rbf"]
+      rbf = np.asarray(rbf.addressable_data(0) if isinstance(rbf, jax.Array) else rbf, dtype=np.float32).ravel()
+      max_logging.log(
+          f"REQUIRED_RBF step={self._train_steps + 1} max={rbf.max():.4f} per_layer=[{','.join(f'{x:.3f}' for x in rbf)}]"
+      )
 
   def create_train_step_fn(self):
     """Creates a train step using jax.value_and_grad with explicit NNX split/merge."""

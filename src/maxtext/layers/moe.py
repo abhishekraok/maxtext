@@ -2685,6 +2685,18 @@ class RoutedMoE(nnx.Module):
               use_single_sparsecore=self.config.ragged_sort_use_single_sparsecore,
           )
 
+      required_rbf = None
+      if getattr(self.config, "log_required_ragged_buffer_factor", False) and all_shards_group_sizes is not None:
+        # The all-to-all path's version of required_ragged_buffer_factor: a receiving shard drops tokens iff the rows
+        # sent to it by every shard of its EP group exceed int(local rows * factor), local rows being its own
+        # (tokens x top_k) count, which is what buffer_size scales.
+        per_dest = all_shards_group_sizes
+        if per_dest.shape[1] != num_ep:  # expert-major: [source shard, expert] -> [source shard, destination shard]
+          per_dest = jnp.sum(per_dest.reshape(per_dest.shape[0], num_ep, -1), axis=2)
+        received = jnp.sum(per_dest, axis=0)[expert_shard_id]
+        required_rbf = received.astype(jnp.float32) / jnp.float32(sorted_selected_experts.shape[0])
+        if self.mesh is not None and self.mesh.axis_names:
+          required_rbf = jax.lax.pmax(required_rbf, tuple(self.mesh.axis_names))
       return (
           x,
           RouteOutput(
@@ -2695,6 +2707,7 @@ class RoutedMoE(nnx.Module):
               lb_loss=lb_loss,
               bias_updates=bias_updates,
               local_group_sizes=local_group_sizes,
+              required_rbf=required_rbf,
           ),
           RouteMetadata(
               expert_shard_id=expert_shard_id,
