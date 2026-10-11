@@ -1536,6 +1536,10 @@ class Qwen3Next(BaseModel):
           " of the scan; 'pairwise' builds the full per-pair decay tensor."
       ),
   )
+  kda_matmul_precision: Literal["default", "high", "highest"] = Field(
+      "default",
+      description="jax.default_matmul_precision for the sub-block KDA path (kda_chunked_impl=subblock).",
+  )
   kda_sub_block: int = Field(
       16,
       description="Sub-block KDA: rows per diagonal sub-block of the intra-chunk matrices (divides gdn_chunk_size).",

@@ -1468,6 +1468,7 @@ gdn_state_dtype: "float32"
 kda_chunked_impl: "pairwise"
 # Sub-block KDA: rows per diagonal sub-block of the intra-chunk matrices.
 kda_sub_block: 16
+kda_matmul_precision: "default"
 # Sub-block KDA: run the chunk-state recurrence as the Pallas kernel in kernels/kda_scan.py (bf16 state).
 kda_pallas_scan: false
 # With kda_fused_input_proj, constrain the concatenated kernel to the weights' embed sharding.
