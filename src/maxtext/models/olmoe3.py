@@ -242,7 +242,8 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       # The recurrence runs along the sequence, so it must see the whole sequence. Left to propagation, a
       # context-sharded sequence shards the scan's chunk axis, and XLA all-gathers every chunk's inputs on each
       # scan iteration (quadratic traffic: 90% of a 64K step at context 2). Gather once per layer instead.
-      seq_whole = ("activation_batch", None, "activation_heads", None)
+      # Its heads may shard instead (activation_kda_heads; olmo35-ep-as-cp puts them on the context axis).
+      seq_whole = ("activation_batch", None, "activation_kda_heads", None)
       q, k, v, log_decay = (nn.with_logical_constraint(t, seq_whole) for t in (q, k, v, log_decay))
       beta = nn.with_logical_constraint(beta, seq_whole[:3])
       resets = nn.with_logical_constraint(resets, seq_whole[:2])

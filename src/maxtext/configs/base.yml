@@ -653,6 +653,7 @@ logical_axis_rules: [
                       ['activation_batch_attn', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
                       ['activation_input_length_attn', ['tensor_sequence', 'context']],
                       ['activation_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
+                      ['activation_kda_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
                       ['activation_kv_heads', ['tensor', 'tensor_sequence']],
                       ['activation_length_attn', ['context', 'context_usp_ulysses']],
                       ['activation_q_length', ['context', 'context_usp_ulysses']],

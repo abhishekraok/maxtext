@@ -139,7 +139,8 @@ class OLMoE3PackingTest(unittest.TestCase):
 
     tokens = jnp.arange(1, seq_len + 1, dtype=jnp.int32)[None, :]
     packed_positions = jnp.concatenate([jnp.arange(doc_len), jnp.arange(doc_len)])[None, :].astype(jnp.int32)
-    packed_segments = jnp.concatenate([jnp.zeros((1, doc_len), jnp.int32), jnp.ones((1, doc_len), jnp.int32)], axis=1)
+    # Segment 0 is padding in MaxText, so real documents count from 1.
+    packed_segments = jnp.concatenate([jnp.ones((1, doc_len), jnp.int32), 2 * jnp.ones((1, doc_len), jnp.int32)], axis=1)
 
     with mesh:
       params = model.init({"params": jax.random.PRNGKey(0)}, tokens, packed_positions, packed_segments)
@@ -154,7 +155,6 @@ class OLMoE3PackingTest(unittest.TestCase):
       solo_logits = solo[0] if isinstance(solo, tuple) else solo
 
     # Positions inside the first document must be unaffected by what follows it.
-    jnp.allclose(packed_logits[:, :doc_len], solo_logits[:, :doc_len], atol=1e-4)
     self.assertTrue(
         jnp.allclose(packed_logits[:, :doc_len], solo_logits[:, :doc_len], atol=1e-4),
         "first document's logits changed when a second document was packed after it",
