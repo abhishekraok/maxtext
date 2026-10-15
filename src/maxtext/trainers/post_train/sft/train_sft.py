@@ -42,6 +42,7 @@ import os
 import jax
 import numpy as np
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec
 import optax
 import pathwaysutils
 
@@ -51,6 +52,7 @@ from flax.core.spmd import logical_axis_rules
 
 from orbax import checkpoint as ocp
 
+from tunix.sft import checkpoint_manager as checkpoint_manager_lib
 from tunix.sft import metrics_logger, peft_trainer, profiler
 
 from maxtext.optimizers import optimizers
@@ -72,6 +74,39 @@ from maxtext.utils import max_logging
 # Placeholder: internal
 from maxtext.utils import maxtext_utils
 from maxtext.utils import model_creation_utils
+
+
+def _log_hbm(where):
+  """Logging only: HBM in use, peak and limit on this host's first device."""
+  stats = jax.local_devices()[0].memory_stats() or {}
+  gib = lambda k: stats.get(k, 0) / 2**30
+  max_logging.log(
+      f"HBM {where}: in_use={gib('bytes_in_use'):.2f} GiB peak={gib('peak_bytes_in_use'):.2f} GiB "
+      f"limit={gib('bytes_limit'):.2f} GiB host={jax.process_index()}"
+  )
+
+
+def _restore_targets_from_live_shardings(state):
+  """Restore targets for the optimizer state, taken from the live arrays' own shardings.
+
+  Tunix's checkpoint_manager._fix_sharding rebuilds them from nnx partition specs, where a logical axis name with no
+  rule (e.g. "mlp_moe") passes through unchanged; it then sees an axis the mesh lacks and replicates the whole leaf, so
+  every expert tensor's Adam moments are restored as a full copy on each chip and the restore runs out of HBM. The live
+  arrays already carry the sharding training uses, so restoring into it changes nothing but the load. Scalars with a
+  single-device sharding (e.g. the step count) are replicated, as Tunix intends.
+  """
+  mesh = next(
+      (x.sharding.mesh for x in jax.tree_util.tree_leaves(state) if isinstance(getattr(x, "sharding", None), NamedSharding)),
+      None,
+  )
+  if mesh is None:
+    return state
+
+  def target(x):
+    sharding = x.sharding if isinstance(getattr(x, "sharding", None), NamedSharding) else NamedSharding(mesh, PartitionSpec())
+    return jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x), sharding=sharding)
+
+  return jax.tree_util.tree_map(target, state)
 
 
 class MaxTextPeftTrainer(peft_trainer.PeftTrainer):
@@ -99,6 +134,8 @@ class MaxTextPeftTrainer(peft_trainer.PeftTrainer):
     )
     ce = xent_sum / (weights + 1e-8) - z  # xent_sum includes the z-loss term
     max_logging.log(f"LOSS-PARTS step={self._train_steps + 1} ce={ce:.6f} moe_lb={lb:.6f} z={z:.6f} tokens={weights:.0f}")
+    if self._train_steps < 20 or (self._train_steps + 1) % 500 == 0:
+      _log_hbm(f"step {self._train_steps + 1}")
     if "moe_required_rbf" in aux:
       # log_required_ragged_buffer_factor: per MoE layer, the smallest ragged_buffer_factor that would not have
       # dropped a token this step; at or below the run's factor, the step dropped nothing.
@@ -338,7 +375,9 @@ def setup_trainer_state(mt_config, goodput_recorder=None):
       nnx.pop(model, nnx.Intermediate)
       if mt_config.lora.lora_restore_path:
         lora_utils.restore_lora_from_path(model, mt_config)
+      checkpoint_manager_lib._fix_sharding = _restore_targets_from_live_shardings  # pylint: disable=protected-access
       trainer = MaxTextPeftTrainer(model, optimizer, tunix_config)
+      _log_hbm("after trainer init (restore included)")
       trainer.with_training_hooks(training_hooks)
       trainer.with_data_hooks(data_hooks)
       trainer = use_maxtext_loss_function(trainer, mt_config)
