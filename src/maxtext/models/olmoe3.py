@@ -244,7 +244,11 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       # scan iteration (quadratic traffic: 90% of a 64K step at context 2). Gather once per layer instead.
       # Its heads may shard instead (activation_kda_heads; olmo35-ep-as-cp puts them on the context axis).
       seq_whole = ("activation_batch", None, "activation_kda_heads", None)
-      q, k, v, log_decay = (nn.with_logical_constraint(t, seq_whole) for t in (q, k, v, log_decay))
+      q, k, log_decay = (nn.with_logical_constraint(t, seq_whole) for t in (q, k, log_decay))
+      # The value dimension is independent in the recurrence (state [dk, dv], u, delta and the output all carry it),
+      # so it may shard too (activation_kda_value; olmo35-cp-ep puts it on the context axis). q, k, the decay, the
+      # intra-chunk matrices and the inverse then repeat on each value shard.
+      v = nn.with_logical_constraint(v, seq_whole[:3] + ("activation_kda_value",))
       beta = nn.with_logical_constraint(beta, seq_whole[:3])
       resets = nn.with_logical_constraint(resets, seq_whole[:2])
 

@@ -195,6 +195,7 @@ class CustomRule(enum.Enum):
   CP_AS_EP = "cp-as-ep"  # Support CP and EP together
   EP_AS_CP = "ep-as-cp"  # Support EP only
   OLMO35_EP_AS_CP = "olmo35-ep-as-cp"  # ep-as-cp with KDA heads on the expert axis
+  OLMO35_CP_EP = "olmo35-cp-ep"  # olmo35-ep-as-cp plus a context axis (EP over context x expert)
   PIPELINE_LARGE_MOE = "pipeline-large-moe"
   FSDP_2D = "2d-fsdp"
   EP_AS_DP = "ep-as-dp"
