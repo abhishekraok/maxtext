@@ -725,6 +725,14 @@ def _delta_rule_chunked_subblock(
   # intra-chunk results below; the bwd then skips the projections, conv, norm, decay activation,
   # intra-chunk build and inverse that per-layer remat would otherwise recompute.
   q_c, k_c, v_c, g, beta_c = (checkpoint_name(t, "context") for t in (q_c, k_c, v_c, g, beta_c))
+  # Pin the chunked layout [B, H, N, C, D]: the chunk axis whole, heads and the value dim as the caller sharded them.
+  # Propagation otherwise re-shards the chunk axis over the sequence's mesh axes (inherited through the reshape, and
+  # in the bwd through the residuals and cotangents), and the scan then all-gathers every chunk's xs on each
+  # iteration: 97.6% of a 475 s step on an 8x8x8 with olmo35-cp-ep (xprof, 2026-10-15). A constraint's transpose is
+  # a constraint, so these pin the bwd too. No-ops where the rules leave these axes unsharded.
+  hd = ("activation_batch", "activation_kda_heads", None, None)
+  q_c, k_c, g, beta_c = (nn.with_logical_constraint(t, hd + (None,)) for t in (q_c, k_c, g, beta_c))
+  v_c = nn.with_logical_constraint(v_c, hd + ("activation_kda_value",))
 
   # Segment layout per chunk, broadcast over heads.
   seg = jnp.cumsum(resets.reshape(batch, n, c).astype(jnp.int32), axis=-1)[:, None]  # [B, 1, N, C]
@@ -754,6 +762,8 @@ def _delta_rule_chunked_subblock(
   x, scores = (checkpoint_name(t, "kda_wy") for t in (x, scores))
   uw = checkpoint_name(uw, "context")
   u, w = uw[..., :dv], uw[..., dv:]
+  u = nn.with_logical_constraint(u, hd + ("activation_kda_value",))
+  w = nn.with_logical_constraint(w, hd + (None,))
   # Only the chunk's last segment writes the carried state.
   g_last = g[..., -1:, :]
   k_carry = k_c.astype(f32) * jnp.exp(jnp.where(last_seg, g_last - g, -jnp.inf))
@@ -762,21 +772,28 @@ def _delta_rule_chunked_subblock(
   def scan_layout(t):  # [B, H, N, ...] -> [N, B, H, ...]
     return jnp.moveaxis(t, 2, 0)
 
+  st_axes = ("activation_batch", "activation_kda_heads", None, "activation_kda_value")  # [B, H, dk, dv]
+  n_whole = lambda t, last: nn.with_logical_constraint(t, (None, "activation_batch", "activation_kda_heads") + (None,) * (t.ndim - 4) + (last,))
+
   def body(state, xs):
     u_i, w_i, kc_i, dl_i, reset_i = xs
     delta = u_i - jnp.einsum("bhcd,bhdv->bhcv", w_i.astype(compute_dtype), state, preferred_element_type=f32)
     delta = delta.astype(compute_dtype)
     kept = jnp.where(reset_i[:, :, None, None], 0.0, state.astype(f32) * dl_i[..., None])
     new_state = kept + jnp.einsum("bhcd,bhcv->bhdv", kc_i.astype(compute_dtype), delta, preferred_element_type=f32)
-    return new_state.astype(compute_dtype), (state, delta)
+    new_state = nn.with_logical_constraint(new_state.astype(compute_dtype), st_axes)
+    return new_state, (state, delta)
 
   if state_scan is not None and compute_dtype == jnp.bfloat16:
     decay = jnp.where(any_reset[..., None], 0.0, decay_last)
     states, delta = state_scan(uw, k_carry.astype(compute_dtype), decay)
   else:
     xs = tuple(scan_layout(t) for t in (u, w, k_carry, decay_last, any_reset))
-    init_state = jnp.zeros((batch, heads, dk, dv), compute_dtype)
+    xs = (n_whole(xs[0], "activation_kda_value"), n_whole(xs[1], None), n_whole(xs[2], None), n_whole(xs[3], None),
+          nn.with_logical_constraint(xs[4], (None, "activation_batch", None)))
+    init_state = nn.with_logical_constraint(jnp.zeros((batch, heads, dk, dv), compute_dtype), st_axes)
     _, (states, delta) = jax.lax.scan(body, init_state, xs)
+    states, delta = n_whole(states, "activation_kda_value"), n_whole(delta, "activation_kda_value")
     states, delta = jnp.moveaxis(states, 0, 2), jnp.moveaxis(delta, 0, 2)  # [B, H, N, ...]
 
   qg = (q_c.astype(f32) * eg * from_prev).astype(compute_dtype)
