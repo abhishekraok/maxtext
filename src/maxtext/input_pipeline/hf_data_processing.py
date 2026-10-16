@@ -550,7 +550,9 @@ def preprocessing_pipeline(
 # trained rows of the global batch rebuilds r2's per-host pipeline for the r2 data hosts those rows belong to (global
 # trained row r is r2 host r // rows, local row r % rows), so a bigger slice trains on r2's exact batches. Every r2 local
 # batch is logged as BATCH-HASH-R2 with r2's process index (4h on r2), comparable with r2's own BATCH-HASH lines and the
-# CPU rebuilds. Untrained rows take an r2 placeholder row.
+# CPU rebuilds. Untrained rows take an r2 placeholder row. An optional fifth field G (default 1) groups r2 steps: step n
+# trains r2 steps G(n-1)+1 .. Gn, so global trained row r is r2 sub-step r // (hosts * rows), then host and local row as
+# above within it (H077's big batch: "8:2:128:32:4" trains 64 rows per step, r2's 4k+1 .. 4k+4).
 _R2_EMULATION = os.environ.get("MAXTEXT_R2_DATA_EMULATION", "")
 
 
@@ -566,8 +568,8 @@ def _batch_sha(batch):
 class _R2EmulatedLoader:
   """Iterates r2's per-host loaders in lockstep and assembles this process's local batch from their trained rows."""
 
-  def __init__(self, loaders, plan, rows, r2_procs_per_host):
-    self.loaders, self.plan, self.rows, self.stride = loaders, plan, rows, r2_procs_per_host
+  def __init__(self, loaders, plan, rows, r2_procs_per_host, group=1):
+    self.loaders, self.plan, self.rows, self.stride, self.group = loaders, plan, rows, r2_procs_per_host, group
 
   def __iter__(self):
     its = {h: iter(dl) for h, dl in self.loaders.items()}
@@ -575,33 +577,40 @@ class _R2EmulatedLoader:
     while True:
       n += 1
       vb = {}
-      for h, it in its.items():
-        try:
-          vb[h] = next(it)
-        except StopIteration:
-          return
-        if multihost_dataloading._LOG_BATCH_HASH:  # pylint: disable=protected-access
-          max_logging.log(f"BATCH-HASH-R2 n={n} host={self.stride * h} sha256={_batch_sha(vb[h])}")
-      any_h = next(iter(vb))
+      for j in range(self.group):
+        r2n = self.group * (n - 1) + j + 1
+        for h, it in its.items():
+          try:
+            vb[(j, h)] = next(it)
+          except StopIteration:
+            return
+          if multihost_dataloading._LOG_BATCH_HASH:  # pylint: disable=protected-access
+            max_logging.log(f"BATCH-HASH-R2 n={r2n} host={self.stride * h} sha256={_batch_sha(vb[(j, h)])}")
+      any_k = next(iter(vb))
       yield {
-          k: np.stack([vb[p[0]][k][p[1]] if p is not None else vb[any_h][k][self.rows] for p in self.plan])
-          for k in vb[any_h]
+          k: np.stack([vb[(p[0], p[1])][k][p[2]] if p is not None else vb[any_k][k][self.rows] for p in self.plan])
+          for k in vb[any_k]
       }
 
 
 def _r2_emulated_train_iterator(
     dataloading_host_index, dataloading_host_count, global_mesh, global_batch_size, config, **kw
 ):  # pylint: disable=unused-argument
-  hosts, rows, load, procs = (int(x) for x in _R2_EMULATION.split(":"))
+  fields = [int(x) for x in _R2_EMULATION.split(":")]
+  hosts, rows, load, procs = fields[:4]
+  group = fields[4] if len(fields) > 4 else 1
   cutoff = config.micro_batch_size_to_train_on
-  assert cutoff == hosts * rows, (cutoff, hosts, rows)
+  assert cutoff == group * hosts * rows, (cutoff, group, hosts, rows)
   pspec = remove_size_one_mesh_axis(jax.sharding.PartitionSpec(*config.data_sharding), global_mesh)
   indices = jax.sharding.NamedSharding(global_mesh, pspec).devices_indices_map((global_batch_size, kw["max_target_length"]))
   plan = []
   for d in global_mesh.local_devices:
-    plan += [divmod(r, rows) if r < cutoff else None for r in range(*indices[d][0].indices(global_batch_size))]
+    plan += [
+        (r // (hosts * rows),) + divmod(r % (hosts * rows), rows) if r < cutoff else None
+        for r in range(*indices[d][0].indices(global_batch_size))
+    ]
   assert len(plan) == global_batch_size // jax.process_count(), (len(plan), global_batch_size, jax.process_count())
-  need = sorted({p[0] for p in plan if p is not None})
+  need = sorted({p[1] for p in plan if p is not None})
   r2_local = load // procs
   mask = [True] * rows + [False] * (r2_local - rows)
   g = globals()
@@ -624,7 +633,9 @@ def _r2_emulated_train_iterator(
     jax.process_count, g["local_rows_trained"], multihost_dataloading.MultiHostDataLoadIterator = saved
   max_logging.log(f"R2-EMULATION process {jax.process_index()}: local rows {plan} from r2 data hosts {need}")
   return multihost_dataloading.MultiHostDataLoadIterator(
-      _R2EmulatedLoader(loaders, plan, rows, procs // hosts), global_mesh, kw.get("generate_padding_batch", False)
+      _R2EmulatedLoader(loaders, plan, rows, procs // hosts, group),
+      global_mesh,
+      kw.get("generate_padding_batch", False),
   )
 
 
