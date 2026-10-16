@@ -14,11 +14,15 @@
 
 """Input pipeline using Huggingface datasets."""
 
+import hashlib
+import os
+import types
 from typing import Optional
 
 import ml_collections
 
 import jax
+import numpy as np
 
 import transformers
 
@@ -541,6 +545,89 @@ def preprocessing_pipeline(
   return multihost_gen
 
 
+# Big-slice data shim (tpu-worker, 2026-10-15): MAXTEXT_R2_DATA_EMULATION="hosts:rows:load:procs", e.g. "8:2:128:32" for
+# r2's v4 4x4x8 (8 data hosts, 2 trained rows each, 128 rows loaded per step over 32 processes). Each process that owns
+# trained rows of the global batch rebuilds r2's per-host pipeline for the r2 data hosts those rows belong to (global
+# trained row r is r2 host r // rows, local row r % rows), so a bigger slice trains on r2's exact batches. Every r2 local
+# batch is logged as BATCH-HASH-R2 with r2's process index (4h on r2), comparable with r2's own BATCH-HASH lines and the
+# CPU rebuilds. Untrained rows take an r2 placeholder row.
+_R2_EMULATION = os.environ.get("MAXTEXT_R2_DATA_EMULATION", "")
+
+
+def _batch_sha(batch):
+  h = hashlib.sha256()
+  for key in sorted(batch):
+    a = np.ascontiguousarray(np.asarray(batch[key]))
+    h.update(f"{key}:{a.dtype.str}:{a.shape}".encode())
+    h.update(a.tobytes())
+  return h.hexdigest()
+
+
+class _R2EmulatedLoader:
+  """Iterates r2's per-host loaders in lockstep and assembles this process's local batch from their trained rows."""
+
+  def __init__(self, loaders, plan, rows, r2_procs_per_host):
+    self.loaders, self.plan, self.rows, self.stride = loaders, plan, rows, r2_procs_per_host
+
+  def __iter__(self):
+    its = {h: iter(dl) for h, dl in self.loaders.items()}
+    n = 0
+    while True:
+      n += 1
+      vb = {}
+      for h, it in its.items():
+        try:
+          vb[h] = next(it)
+        except StopIteration:
+          return
+        if multihost_dataloading._LOG_BATCH_HASH:  # pylint: disable=protected-access
+          max_logging.log(f"BATCH-HASH-R2 n={n} host={self.stride * h} sha256={_batch_sha(vb[h])}")
+      any_h = next(iter(vb))
+      yield {
+          k: np.stack([vb[p[0]][k][p[1]] if p is not None else vb[any_h][k][self.rows] for p in self.plan])
+          for k in vb[any_h]
+      }
+
+
+def _r2_emulated_train_iterator(
+    dataloading_host_index, dataloading_host_count, global_mesh, global_batch_size, config, **kw
+):  # pylint: disable=unused-argument
+  hosts, rows, load, procs = (int(x) for x in _R2_EMULATION.split(":"))
+  cutoff = config.micro_batch_size_to_train_on
+  assert cutoff == hosts * rows, (cutoff, hosts, rows)
+  pspec = remove_size_one_mesh_axis(jax.sharding.PartitionSpec(*config.data_sharding), global_mesh)
+  indices = jax.sharding.NamedSharding(global_mesh, pspec).devices_indices_map((global_batch_size, kw["max_target_length"]))
+  plan = []
+  for d in global_mesh.local_devices:
+    plan += [divmod(r, rows) if r < cutoff else None for r in range(*indices[d][0].indices(global_batch_size))]
+  assert len(plan) == global_batch_size // jax.process_count(), (len(plan), global_batch_size, jax.process_count())
+  need = sorted({p[0] for p in plan if p is not None})
+  r2_local = load // procs
+  mask = [True] * rows + [False] * (r2_local - rows)
+  g = globals()
+  saved = (jax.process_count, g["local_rows_trained"], multihost_dataloading.MultiHostDataLoadIterator)
+  loaders = {}
+  try:
+    jax.process_count = lambda: procs
+    g["local_rows_trained"] = lambda *a, **k: list(mask)
+    multihost_dataloading.MultiHostDataLoadIterator = lambda dataloader, *a, **k: dataloader
+    for h in need:
+      loaders[h] = preprocessing_pipeline(
+          dataloading_host_index=h,
+          dataloading_host_count=hosts,
+          global_mesh=types.SimpleNamespace(size=load),
+          global_batch_size=load,
+          config=config,
+          **kw,
+      )
+  finally:
+    jax.process_count, g["local_rows_trained"], multihost_dataloading.MultiHostDataLoadIterator = saved
+  max_logging.log(f"R2-EMULATION process {jax.process_index()}: local rows {plan} from r2 data hosts {need}")
+  return multihost_dataloading.MultiHostDataLoadIterator(
+      _R2EmulatedLoader(loaders, plan, rows, procs // hosts), global_mesh, kw.get("generate_padding_batch", False)
+  )
+
+
 def make_hf_train_iterator(
     config: ml_collections.ConfigDict,
     global_mesh,
@@ -570,7 +657,7 @@ def make_hf_train_iterator(
         global_batch_size=config.global_batch_size_to_load,
     )
   else:
-    train_iter = preprocessing_pipeline(
+    train_iter = (_r2_emulated_train_iterator if _R2_EMULATION else preprocessing_pipeline)(
         dataloading_host_index=process_indices_train.index(jax.process_index()),
         dataloading_host_count=len(process_indices_train),
         global_mesh=global_mesh,
