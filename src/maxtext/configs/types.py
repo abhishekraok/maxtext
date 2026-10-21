@@ -1092,6 +1092,15 @@ class MoEGeneral(BaseModel):
           "still drops tokens is replayed with the dropless program. Must be >= ragged_buffer_factor. 0 = off."
       ),
   )
+  log_moe_dropped_tokens: bool = Field(
+      False,
+      description=(
+          "Probe, with log_required_ragged_buffer_factor: also log per train step and per MoE layer how many routed "
+          "(token, expert) rows the ragged buffer dropped, sum over receiving shards of max(0, rows received - buffer "
+          "rows), and the rows routed. Two more float32 scalar sum all-reduces per MoE layer and token chunk; the "
+          "forward and backward values are unchanged."
+      ),
+  )
   log_required_ragged_buffer_factor: bool = Field(
       False,
       description=(
@@ -4023,6 +4032,8 @@ class MaxTextConfig(
         raise ValueError("log_required_ragged_buffer_factor=True with use_ring_of_experts=True requires use_ragged_sort=True.")
       if self.num_moe_emb_chunks > 0:
         raise ValueError("log_required_ragged_buffer_factor=True does not support num_moe_emb_chunks > 0.")
+    if self.log_moe_dropped_tokens and not self.log_required_ragged_buffer_factor:
+      raise ValueError("log_moe_dropped_tokens=True requires log_required_ragged_buffer_factor=True.")
 
   def validate_ragged_buffer_factor(self):
     """Validates that ragged_buffer_factor and eval_ragged_buffer_factor are used with supported settings."""

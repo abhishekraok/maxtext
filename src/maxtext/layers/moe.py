@@ -113,6 +113,33 @@ class RouteOutput:
   required_rbf: Optional[jax.Array] = None
 
 
+def _probe_with_drops(required, received, buffer_rows, routed_rows, mesh, log_drops):
+  """log_required_ragged_buffer_factor probe value, max over the mesh; with log_moe_dropped_tokens a float32 vector
+  [required factor (max), dropped rows (sum over receiving shards), routed rows (sum)] instead. A shard keeps
+  min(received, buffer_rows) rows (_truncate_matrix's clamp), so it drops max(0, received - buffer_rows). Probe
+  scalars only: nothing here feeds the forward or backward pass."""
+  axes = tuple(mesh.axis_names) if mesh is not None and mesh.axis_names else ()
+  if axes:
+    required = jax.lax.pmax(required, axes)
+  if not log_drops:
+    return required
+  received = jnp.asarray(received).astype(jnp.float32)
+  dropped = jnp.maximum(received - jnp.float32(buffer_rows), 0.0) if buffer_rows is not None else jnp.float32(0.0)
+  routed = jnp.float32(routed_rows)
+  if axes:
+    dropped, routed = jax.lax.psum(dropped, axes), jax.lax.psum(routed, axes)
+  return jnp.stack([required, dropped, routed])
+
+
+def _combine_probe(values):
+  """Combines per-chunk probe values: the factor is the max over chunks (each has its own buffer), drop and routed
+  counts add up."""
+  s = jnp.stack(values)
+  if s.ndim == 1:
+    return jnp.max(s)
+  return jnp.concatenate([jnp.max(s[:, :1], axis=0), jnp.sum(s[:, 1:], axis=0)])
+
+
 def _truncate_matrix(all_shards_group_sizes: jax.Array, buffer_size: int) -> jax.Array:
   """Truncates the traffic matrix to fit in buffer_size on receiver side.
 
@@ -729,10 +756,12 @@ class RoutedMoE(nnx.Module):
         group_sizes, expert_shard_id * local_num_experts, local_num_experts, axis=0
     )
     balanced_size = (bsz_times_seq_len // num_ep) * self.num_experts_per_tok
-    required = jnp.sum(local_group_sizes).astype(jnp.float32) / jnp.float32(balanced_size)
-    if self.mesh is not None and self.mesh.axis_names:
-      required = jax.lax.pmax(required, tuple(self.mesh.axis_names))
-    return required
+    received = jnp.sum(local_group_sizes)
+    required = received.astype(jnp.float32) / jnp.float32(balanced_size)
+    log_drops = getattr(self.config, "log_moe_dropped_tokens", False)
+    factor = self.get_ragged_buffer_factor() if log_drops else 0.0
+    buffer_rows = int(balanced_size * factor) if factor > 0.0 else None
+    return _probe_with_drops(required, received, buffer_rows, balanced_size, self.mesh, log_drops)
 
   def __init__(
       self,
@@ -2694,9 +2723,20 @@ class RoutedMoE(nnx.Module):
         if per_dest.shape[1] != num_ep:  # expert-major: [source shard, expert] -> [source shard, destination shard]
           per_dest = jnp.sum(per_dest.reshape(per_dest.shape[0], num_ep, -1), axis=2)
         received = jnp.sum(per_dest, axis=0)[expert_shard_id]
-        required_rbf = received.astype(jnp.float32) / jnp.float32(sorted_selected_experts.shape[0])
-        if self.mesh is not None and self.mesh.axis_names:
-          required_rbf = jax.lax.pmax(required_rbf, tuple(self.mesh.axis_names))
+        local_rows = sorted_selected_experts.shape[0]
+        required_rbf = received.astype(jnp.float32) / jnp.float32(local_rows)
+        factor = self.get_ragged_buffer_factor()
+        buffer_rows = (
+            self.get_ragged_buffer_size(
+                local_rows, num_ep, self.config.num_experts, self.config.num_experts_per_tok, factor
+            )
+            if factor > 0.0
+            else None
+        )
+        required_rbf = _probe_with_drops(
+            required_rbf, received, buffer_rows, local_rows, self.mesh,
+            getattr(self.config, "log_moe_dropped_tokens", False),
+        )
       return (
           x,
           RouteOutput(
@@ -3353,7 +3393,7 @@ class RoutedMoE(nnx.Module):
           has_overflows.append(ov_c)
           required_rbfs.append(req_c)
         bias_updates = None if bias_updates_list[0] is None else sum(bias_updates_list) / num
-        required_rbf = None if required_rbfs[0] is None else jnp.max(jnp.stack(required_rbfs))
+        required_rbf = None if required_rbfs[0] is None else _combine_probe(required_rbfs)
         return jnp.concatenate(outs, axis=1), lb_loss, bias_updates, jnp.any(jnp.stack(has_overflows)), required_rbf
 
       def _route_and_compute(force_dropless, n_chunks=n_chunks, barrier_enabled=barrier_enabled):
@@ -3424,7 +3464,7 @@ class RoutedMoE(nnx.Module):
         bias_updates = None if bias_updates_list[0] is None else sum(bias_updates_list) / n_chunks
         has_overflow = jnp.any(jnp.stack(has_overflows))
         # Each chunk has its own buffer, so the step needs the largest per-chunk factor.
-        required_rbf = None if required_rbfs[0] is None else jnp.max(jnp.stack(required_rbfs))
+        required_rbf = None if required_rbfs[0] is None else _combine_probe(required_rbfs)
         return output, lb_loss, bias_updates, has_overflow, required_rbf
 
       force_dropless = getattr(self, "force_dropless", False)

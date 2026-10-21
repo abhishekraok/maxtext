@@ -3678,6 +3678,37 @@ class RequiredRaggedBufferFactorTest(unittest.TestCase):
     self.assertEqual(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.5), 12)
     self.assertLess(moe.RoutedMoE.get_ragged_buffer_size(8, 2, 4, 2, 1.49), 12)
 
+  def test_dropped_rows_ring(self):
+    # As above at factor 1.25: shard 1's buffer is int(8 * 1.25) = 10 rows and it receives 12, so it drops 2 of
+    # its 8 balanced rows; shard 0 receives 2 and drops none.
+    fake = SimpleNamespace(
+        config=SimpleNamespace(num_experts=4, log_moe_dropped_tokens=True),
+        num_experts_per_tok=2,
+        mesh=None,
+        get_ragged_buffer_factor=lambda: 1.25,
+    )
+    g = jnp.array([1, 1, 6, 6], dtype=jnp.int32)
+    v1 = moe.RoutedMoE.required_ragged_buffer_factor(fake, g, 8, 2, 1)
+    v0 = moe.RoutedMoE.required_ragged_buffer_factor(fake, g, 8, 2, 0)
+    self.assertEqual([float(x) for x in v1], [1.5, 2.0, 8.0])
+    self.assertEqual([float(x) for x in v0], [0.25, 0.0, 8.0])
+
+  def test_dropped_rows_off_is_scalar(self):
+    fake = SimpleNamespace(config=SimpleNamespace(num_experts=4), num_experts_per_tok=2, mesh=None)
+    v = moe.RoutedMoE.required_ragged_buffer_factor(fake, jnp.array([1, 1, 6, 6], dtype=jnp.int32), 8, 2, 1)
+    self.assertEqual(jnp.shape(v), ())
+
+  def test_probe_with_drops_and_combine(self):
+    # No buffer (worst-case size): nothing can drop.
+    v = moe._probe_with_drops(jnp.float32(2.0), 12, None, 8, None, True)
+    self.assertEqual([float(x) for x in v], [2.0, 0.0, 8.0])
+    v = moe._probe_with_drops(jnp.float32(1.5), 12, 10, 8, None, True)
+    self.assertEqual([float(x) for x in v], [1.5, 2.0, 8.0])
+    # Chunks: factor is the max, drop and routed counts add.
+    c = moe._combine_probe([jnp.array([1.5, 2.0, 8.0]), jnp.array([1.75, 3.0, 8.0])])
+    self.assertEqual([float(x) for x in c], [1.75, 5.0, 16.0])
+    self.assertEqual(float(moe._combine_probe([jnp.float32(1.5), jnp.float32(1.75)])), 1.75)
+
 
 if __name__ == "__main__":
   absltest.main()

@@ -141,6 +141,14 @@ class MaxTextPeftTrainer(peft_trainer.PeftTrainer):
       # dropped a token this step; at or below the run's factor, the step dropped nothing.
       rbf = aux["moe_required_rbf"]
       rbf = np.asarray(rbf.addressable_data(0) if isinstance(rbf, jax.Array) else rbf, dtype=np.float32).ravel()
+      if getattr(self.config, "log_moe_dropped_tokens", False):
+        # per layer [factor, dropped rows, routed rows]; rows are (token, expert) pairs, summed over receiving shards
+        per = rbf.reshape(-1, 3)
+        rbf, dropped, routed = per[:, 0], per[:, 1], per[:, 2]
+        max_logging.log(
+            f"MOE-DROPPED step={self._train_steps + 1} dropped={dropped.sum():.0f} routed={routed.sum():.0f} "
+            f"frac={dropped.sum() / max(routed.sum(), 1.0):.3e} per_layer=[{','.join(f'{x:.0f}' for x in dropped)}]"
+        )
       max_logging.log(
           f"REQUIRED_RBF step={self._train_steps + 1} max={rbf.max():.4f} per_layer=[{','.join(f'{x:.3f}' for x in rbf)}]"
       )

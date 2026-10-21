@@ -378,7 +378,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     # moe_has_overflow). Leaf order of collect_intermediates_by_suffix; scanned layers contribute one entry each.
     required_rbf_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "moe_required_rbf")
     if required_rbf_values:
-      aux["moe_required_rbf"] = jnp.concatenate([x.astype(jnp.float32) for x in required_rbf_values])
+      # reshape(-1): with log_moe_dropped_tokens each layer's value is [factor, dropped, routed] (train_sft splits it).
+      aux["moe_required_rbf"] = jnp.concatenate([x.astype(jnp.float32).reshape(-1) for x in required_rbf_values])
   return loss, aux
 
 
