@@ -3692,6 +3692,9 @@ class RequiredRaggedBufferFactorTest(unittest.TestCase):
     v0 = moe.RoutedMoE.required_ragged_buffer_factor(fake, g, 8, 2, 0)
     self.assertEqual([float(x) for x in v1], [1.5, 2.0, 8.0])
     self.assertEqual([float(x) for x in v0], [0.25, 0.0, 8.0])
+    # The dropless fallback branch has no cap: it reports the factor but no drops.
+    vd = moe.RoutedMoE.required_ragged_buffer_factor(fake, g, 8, 2, 1, force_dropless=True)
+    self.assertEqual([float(x) for x in vd], [1.5, 0.0, 8.0])
 
   def test_dropped_rows_off_is_scalar(self):
     fake = SimpleNamespace(config=SimpleNamespace(num_experts=4), num_experts_per_tok=2, mesh=None)

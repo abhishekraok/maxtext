@@ -117,7 +117,9 @@ def _probe_with_drops(required, received, buffer_rows, routed_rows, mesh, log_dr
   """log_required_ragged_buffer_factor probe value, max over the mesh; with log_moe_dropped_tokens a float32 vector
   [required factor (max), dropped rows (sum over receiving shards), routed rows (sum)] instead. A shard keeps
   min(received, buffer_rows) rows (_truncate_matrix's clamp), so it drops max(0, received - buffer_rows). Probe
-  scalars only: nothing here feeds the forward or backward pass."""
+  scalars only: nothing here feeds the forward or backward pass. The sums run over every mesh axis: on a mesh whose
+  non-trivial axes all partition tokens or receiving experts (e.g. fsdp x expert) each receiving shard counts once;
+  where routing is replicated over an axis both sums scale by its size, so the dropped/routed ratio still holds."""
   axes = tuple(mesh.axis_names) if mesh is not None and mesh.axis_names else ()
   if axes:
     required = jax.lax.pmax(required, axes)
@@ -743,7 +745,7 @@ class GateLogit(nnx.Module):
 class RoutedMoE(nnx.Module):
   """Implements a routed MoE block."""
 
-  def required_ragged_buffer_factor(self, group_sizes, bsz_times_seq_len, num_ep, expert_shard_id):
+  def required_ragged_buffer_factor(self, group_sizes, bsz_times_seq_len, num_ep, expert_shard_id, force_dropless=False):
     """log_required_ragged_buffer_factor probe: the smallest ragged_buffer_factor that would not have dropped tokens.
 
     group_sizes are the global per-expert token counts of the (EP-gathered) batch, as ring_ragged_sort computes them
@@ -759,7 +761,8 @@ class RoutedMoE(nnx.Module):
     received = jnp.sum(local_group_sizes)
     required = received.astype(jnp.float32) / jnp.float32(balanced_size)
     log_drops = getattr(self.config, "log_moe_dropped_tokens", False)
-    factor = self.get_ragged_buffer_factor() if log_drops else 0.0
+    # force_dropless (the in-layer fallback branch) runs without the cap, as permute() does: nothing can drop.
+    factor = self.get_ragged_buffer_factor() if log_drops and not force_dropless else 0.0
     buffer_rows = int(balanced_size * factor) if factor > 0.0 else None
     return _probe_with_drops(required, received, buffer_rows, balanced_size, self.mesh, log_drops)
 
@@ -2542,7 +2545,7 @@ class RoutedMoE(nnx.Module):
       required_rbf = None
       if getattr(self.config, "log_required_ragged_buffer_factor", False):
         required_rbf = self.required_ragged_buffer_factor(
-            group_sizes, logits.shape[0] * logits.shape[1], num_ep, expert_shard_id
+            group_sizes, logits.shape[0] * logits.shape[1], num_ep, expert_shard_id, force_dropless=force_dropless
         )
       return (
           x,
