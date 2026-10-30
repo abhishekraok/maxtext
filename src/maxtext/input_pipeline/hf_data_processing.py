@@ -438,10 +438,24 @@ def preprocessing_pipeline(
       )
 
     data_column_names = list(dataset.features.keys())
-    dataset = dataset.map(
-        input_pipeline_utils.apply_chat_template,
-        fn_kwargs={"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
-    )
+    template_workers = int(os.environ.get("MAXTEXT_SFT_TEMPLATE_WORKERS", "0"))
+    if template_workers > 0:
+      # The same rows in the same order, templated in parallel: a resume replays every trained batch through this.
+      dataset = dataset.map(
+          input_pipeline_utils.apply_chat_template_batched,
+          batched=True,
+          batch_size=16 * template_workers,
+          fn_kwargs={
+              "tokenizer_model": tokenizer,
+              "data_column_name": data_column_names[0],
+              "workers": template_workers,
+          },
+      )
+    else:
+      dataset = dataset.map(
+          input_pipeline_utils.apply_chat_template,
+          fn_kwargs={"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
+      )
 
   pad_id = _get_pad_id(tokenizer)
 

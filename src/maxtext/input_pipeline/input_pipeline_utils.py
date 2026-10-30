@@ -15,8 +15,10 @@
 """Operations used by Grain"""
 
 import dataclasses
+import multiprocessing
 import os
 import re
+import time
 import warnings
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
@@ -446,18 +448,72 @@ def apply_chat_template(example, tokenizer_model, data_column_name):
         prompt (if applicable). `False` indicates the expected LLM
         completion, excluding the assistant's start tokens.
   """
-  conversation = list(example[data_column_name])
+  segments = _conversation_segments(tokenizer_model, example[data_column_name])
+  example["is_prompt"] = [is_prompt for _, is_prompt in segments]
+  example[data_column_name] = [text for text, _ in segments]
+  return example
+
+
+def _conversation_segments(tokenizer_model, conversation):
+  """The (token ids, is_prompt) segments of one conversation; see apply_chat_template."""
+  conversation = list(conversation)
   try:
     for idx, message in enumerate(conversation):
       if message["role"] == "system" and idx != 0:
         raise ValueError(f"System message found at index {idx}. System messages must be at index 0.")
-    segments = _split_conversation_into_segments(tokenizer_model, conversation)
+    return _split_conversation_into_segments(tokenizer_model, conversation)
   except ValueError as e:
     max_logging.log(f"Unable to apply chat template: {e}")
     raise e
-  example["is_prompt"] = [is_prompt for _, is_prompt in segments]
-  example[data_column_name] = [text for text, _ in segments]
-  return example
+
+
+_TEMPLATE_POOL = None  # (pid, pool): one pool per process that runs the dataset map
+_POOL_TOKENIZER = None  # the tokenizer inside a pool worker
+
+
+def _template_pool_init(tokenizer_model):
+  global _POOL_TOKENIZER
+  _POOL_TOKENIZER = tokenizer_model
+
+
+def _template_pool_segments(conversation):
+  return _conversation_segments(_POOL_TOKENIZER, conversation)
+
+
+def _template_pool(tokenizer_model, workers):
+  """A spawn-context pool for the process running the map, its workers holding a pickled copy of tokenizer_model."""
+  global _TEMPLATE_POOL
+  if _TEMPLATE_POOL is None or _TEMPLATE_POOL[0] != os.getpid():
+    # Grain reads the dataset in a daemonic worker process, and daemonic processes may not start children. The
+    # pool's own workers are daemonic, so they are terminated when that process exits.
+    start = time.time()
+    process = multiprocessing.current_process()
+    daemon = process._config.get("daemon")  # pylint: disable=protected-access
+    process._config["daemon"] = False  # pylint: disable=protected-access
+    try:
+      pool = multiprocessing.get_context("spawn").Pool(
+          workers, initializer=_template_pool_init, initargs=(tokenizer_model,)
+      )
+    finally:
+      process._config["daemon"] = daemon  # pylint: disable=protected-access
+    pool.map(abs, range(workers), chunksize=1)
+    max_logging.log(f"Chat template: {workers} spawned workers in process {os.getpid()} ready in {time.time() - start:.1f}s")
+    _TEMPLATE_POOL = (os.getpid(), pool)
+  return _TEMPLATE_POOL[1]
+
+
+def apply_chat_template_batched(batch, tokenizer_model, data_column_name, workers):
+  """apply_chat_template over a batch, its conversations templated in order by `workers` spawned processes.
+
+  The rows and their order are those of apply_chat_template; only the work is spread. Templating with prefix labels
+  dominates the cost of replaying already-trained batches on resume.
+  """
+  conversations = batch[data_column_name]
+  pool = _template_pool(tokenizer_model, workers)
+  all_segments = pool.map(_template_pool_segments, conversations, chunksize=max(1, len(conversations) // (4 * workers)))
+  batch["is_prompt"] = [[is_prompt for _, is_prompt in segments] for segments in all_segments]
+  batch[data_column_name] = [[text for text, _ in segments] for segments in all_segments]
+  return batch
 
 
 def tokenization(example, hf_tokenizer, truncation, max_length, column_names):
