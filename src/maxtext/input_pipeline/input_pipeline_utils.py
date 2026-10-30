@@ -362,6 +362,12 @@ def _split_conversation_into_segments(tokenizer_model, conversation):
     same tokens back.
   """
 
+  # A conversation of one `document` message is pretraining-style text (e.g. long-context replay): it is tokenized
+  # without the chat template, ends with one end-of-sequence token, and every token is trained.
+  if len(conversation) == 1 and conversation[0]["role"] == "document":
+    ids = extract_token_ids(tokenizer_model(conversation[0]["content"], add_special_tokens=False))
+    return [(list(ids) + [tokenizer_model.eos_token_id], False)]
+
   # Which labelling rule to follow is the recipe's, not the template's: open-instruct main labels
   # `{% generation %}` blocks (allenai/open-instruct#1879), while older branches (e.g. the Olmo 3.5 hero SFT
   # runs) derive spans from rendered prefixes even when the template has blocks. They differ on templates whose
