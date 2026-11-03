@@ -253,6 +253,8 @@ class MultiHostDataLoadIterator:
     self._reset_and_unread = False
     self.generate_padding_batch = generate_padding_batch
     self.expansion_loading_factor_for_grain = expansion_loading_factor_for_grain
+    # Raw rows the packed batches read so far (each packed row's largest segment id), for resume seeks.
+    self.rows_consumed = 0
     _GLOBAL_MULTIHOST_ITERATORS.add(self)
 
   def reset(self):
@@ -332,6 +334,8 @@ class MultiHostDataLoadIterator:
         raise TimeoutError(f"Failed to load data after {MAX_DATA_LOAD_ATTEMPTS} retry attempts.")
 
       self.last_local_data = local_data
+      if isinstance(local_data, dict) and "inputs_segmentation" in local_data:
+        self.rows_consumed += int(np.max(local_data["inputs_segmentation"], axis=-1).sum())
     if _LOG_BATCH_HASH:
       _log_batch_hash(self, local_data)
     input_gdas = jtu.tree_map_with_path(partial(_form_global_array, global_mesh=self.global_mesh), local_data)

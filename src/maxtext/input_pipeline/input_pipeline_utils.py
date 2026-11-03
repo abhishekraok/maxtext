@@ -15,8 +15,10 @@
 """Operations used by Grain"""
 
 import dataclasses
+import itertools
 import os
 import re
+import time
 import warnings
 from threading import current_thread
 from typing import Any, Iterable, TYPE_CHECKING
@@ -561,6 +563,8 @@ class HFDataSource(grain.RandomAccessDataSource):
       num_threads: int,
       max_target_length: int,
       data_column_names: list[str],
+      skip_rows: int = 0,
+      row_maps: list | None = None,
   ):
     from datasets.distributed import split_dataset_by_node  # pylint: disable=import-outside-toplevel
 
@@ -579,6 +583,35 @@ class HFDataSource(grain.RandomAccessDataSource):
     self.dataset_shards = [dataloading_host_index * self.num_threads + i for i in range(self.num_threads)]
     self.datasets = [self._split_dataset_by_node(dataset, world_size=self.n_shards, rank=x) for x in self.dataset_shards]
     self.data_iters = []
+    self.skip_rows = skip_rows
+    self.row_maps = row_maps or []
+
+  def _seek(self):
+    """Positions the (single) thread after `skip_rows` rows of this host's stream, lazily in the reading process.
+
+    Whole shards are passed over by their parquet row counts; the rest of the offset is read as raw rows from a fresh
+    shard iterator, which reproduces the shard's buffer shuffle. The row maps run only on the rows that follow.
+    """
+    left, start = self.skip_rows, time.perf_counter()
+    while left >= (n := _shard_rows(self.datasets[0])):
+      left -= n
+      self.dataset_shards[0] += self.dataloading_host_count
+      self.datasets[0] = self._split_dataset_by_node(self.dataset, world_size=self.n_shards, rank=self.dataset_shards[0])
+    it = iter(self.datasets[0])
+    next(itertools.islice(it, left, left), None)
+    self.data_iters = [it]
+    max_logging.log(
+        f"Resume seek: host {self.dataloading_host_index} skipped {self.skip_rows} rows to shard "
+        f"{self.dataset_shards[0]} offset {left} in {time.perf_counter() - start:.1f}s"
+    )
+
+  def _apply_row_maps(self, row):
+    for function, fn_kwargs, batched in self.row_maps:
+      if batched:
+        row = {k: v[0] for k, v in function({k: [v] for k, v in row.items()}, **fn_kwargs).items()}
+      else:
+        row = function(row, **fn_kwargs)
+    return row
 
   def _check_shard_count(self):
     if self.n_shards < (self.dataloading_host_count * self.num_threads):
@@ -614,15 +647,44 @@ class HFDataSource(grain.RandomAccessDataSource):
     """Since HuggingFace IterableDataset does not support random access by index.
     The next item in the iterator is returned."""
     if not self.data_iters:
-      self.data_iters = [iter(x) for x in self.datasets]
+      if self.skip_rows:
+        self._seek()
+      else:
+        self.data_iters = [iter(x) for x in self.datasets]
     idx = int(current_thread().name.split("_")[1])
 
     while True:
       try:
         data = next(self.data_iters[idx])
-        return data
+        return self._apply_row_maps(data) if self.row_maps else data
       except StopIteration:
         self._update_shard(idx)
+
+
+def _shard_rows(split_dataset) -> int:
+  """Rows in one split of a streaming parquet dataset, from the parquet footers; counts by reading if not parquet."""
+  import fsspec  # pylint: disable=import-outside-toplevel
+  import pyarrow.parquet as pq  # pylint: disable=import-outside-toplevel
+
+  found = []
+  stack = [split_dataset._prepare_ex_iterable_for_iteration()]  # pylint: disable=protected-access
+  while stack:
+    ex = stack.pop()
+    kwargs = getattr(ex, "kwargs", None)
+    if isinstance(kwargs, dict) and "files" in kwargs:
+      found.append(kwargs)
+    for attr in ("ex_iterable", "ex_iterables"):
+      child = getattr(ex, attr, None)
+      stack.extend(child if isinstance(child, list) else [child] if child is not None else [])
+  files = [(f, (kw.get("row_groups_list") or [None] * len(kw["files"]))[i]) for kw in found for i, f in enumerate(kw["files"])]
+  if not files or not all(str(f).endswith(".parquet") for f, _ in files):
+    return sum(1 for _ in split_dataset)
+  total = 0
+  for f, row_groups in files:
+    with fsspec.open(str(f), "rb") as fh:
+      meta = pq.ParquetFile(fh).metadata
+    total += meta.num_rows if row_groups is None else sum(meta.row_group(i).num_rows for i in row_groups)
+  return total
 
 
 ########## Functions used by Grain pipeline

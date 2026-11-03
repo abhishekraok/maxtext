@@ -359,8 +359,13 @@ def preprocessing_pipeline(
     chat_template: Optional[str] = None,
     formatting_func_path: Optional[str] = None,
     formatting_func_kwargs: Optional[dict] = None,
+    skip_rows: int = 0,
 ):
-  """pipeline for preprocessing HF dataset"""
+  """pipeline for preprocessing HF dataset
+
+  skip_rows > 0 starts this host's stream after that many raw rows (a resume seek): the per-row maps then run in
+  HFDataSource after the seek instead of as dataset maps, so skipped rows are never templated or tokenized.
+  """
   import datasets  # pylint: disable=import-outside-toplevel
 
   assert global_batch_size % global_mesh.size == 0, "Batch size should be divisible by number of global devices."
@@ -406,6 +411,7 @@ def preprocessing_pipeline(
   )
 
   dataset = dataset.select_columns(data_column_names)
+  row_maps = []  # (function, fn_kwargs, batched), applied in order
 
   if use_sft:
     if not chat_template:
@@ -438,25 +444,36 @@ def preprocessing_pipeline(
       )
 
     data_column_names = list(dataset.features.keys())
-    dataset = dataset.map(
-        input_pipeline_utils.apply_chat_template,
-        fn_kwargs={"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
+    row_maps.append(
+        (
+            input_pipeline_utils.apply_chat_template,
+            {"tokenizer_model": tokenizer, "data_column_name": data_column_names[0]},
+            False,
+        )
     )
 
   pad_id = _get_pad_id(tokenizer)
 
   if tokenize:
-    dataset = dataset.map(
-        input_pipeline_utils.tokenization,
-        batched=True,
-        fn_kwargs={
-            "hf_tokenizer": tokenizer,
-            "truncation": not use_sft,
-            "max_length": max_target_length,
-            "column_names": data_column_names,
-        },
+    row_maps.append(
+        (
+            input_pipeline_utils.tokenization,
+            {
+                "hf_tokenizer": tokenizer,
+                "truncation": not use_sft,
+                "max_length": max_target_length,
+                "column_names": data_column_names,
+            },
+            True,
+        )
     )
 
+  if skip_rows:
+    assert num_threads == 1, "a resume seek supports one data thread"
+  else:
+    for function, fn_kwargs, batched in row_maps:
+      dataset = dataset.map(function, batched=batched, fn_kwargs=fn_kwargs)
+    row_maps = []
   dataset = input_pipeline_utils.HFDataSource(
       dataset,
       dataloading_host_index,
@@ -464,6 +481,8 @@ def preprocessing_pipeline(
       num_threads,
       max_target_length,
       data_column_names,
+      skip_rows=skip_rows,
+      row_maps=row_maps,
   )
   operations = []
   if use_sft:
@@ -647,6 +666,9 @@ def make_hf_train_iterator(
   """Load, preprocess dataset and return iterators"""
   import datasets  # pylint: disable=import-outside-toplevel
 
+  # Set only while hooks.BaseDataHooks rebuilds the train iterator for a resume seek.
+  skip_rows = int(os.environ.get("MAXTEXT_DATA_SKIP_ROWS", "0"))
+  assert not (skip_rows and (_R2_EMULATION or config.use_multimodal)), "a resume seek supports the text SFT pipeline"
   train_ds = datasets.load_dataset(
       config.hf_path,
       name=config.hf_name,
@@ -698,6 +720,7 @@ def make_hf_train_iterator(
         formatting_func_path=config.formatting_func_path,
         formatting_func_kwargs=config.formatting_func_kwargs,
         grain_worker_count=config.grain_worker_count,
+        **({"skip_rows": skip_rows} if skip_rows else {}),
     )
   return train_iter
 

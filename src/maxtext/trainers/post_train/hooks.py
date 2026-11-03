@@ -16,12 +16,15 @@
 
 from collections import defaultdict
 import abc
+import json
+import os
 from typing import override
 
 import jax
 import jax.numpy as jnp
 import time
 
+from etils import epath
 from flax import nnx
 
 from tunix.sft import peft_trainer
@@ -205,26 +208,78 @@ class BaseDataHooks(DataHooks):
 
   def __init__(self, config, mesh, goodput_recorder):
     self.config = config
+    self.mesh = mesh
     self.train_data_iterator, self.eval_data_iterator = create_data_iterator(config, mesh)
     self.train_data_loader = DataLoader(config, mesh, self.train_data_iterator, goodput_recorder=goodput_recorder)
     self.train_batch = None
     self.eval_batch = None
     self._resume_skip_done = False
+    # Every MAXTEXT_DATA_POSITION_PERIOD batches, each process records the raw rows its loader has read, so a resume
+    # seeks there and replays at most a period of batches. MAXTEXT_DATA_POSITIONS_DIR reads positions from elsewhere.
+    self._loaded = 0
+    self._position_period = int(os.environ.get("MAXTEXT_DATA_POSITION_PERIOD", "100"))
+    self._positions = None
+    if config.dataset_type == "hf" and config.packing and config.checkpoint_dir:
+      self._positions = epath.Path(config.checkpoint_dir).parent / "data_positions"
+
+  def _record_position(self):
+    self._loaded += 1
+    if self._positions is None or self._loaded % self._position_period:
+      return
+    rows = getattr(self.train_data_loader.data_iterator, "rows_consumed", None)
+    record = {"step": self._loaded, "rows": rows, "process_count": jax.process_count()}
+    try:
+      path = self._positions / str(self._loaded) / f"process_{jax.process_index()}.json"
+      path.parent.mkdir(parents=True, exist_ok=True)
+      path.write_text(json.dumps(record))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      max_logging.log(f"Could not record data position {record}: {e}")
+
+  def _find_position(self, n):
+    """The largest step <= n that every process recorded, and this process's rows there; (0, None) if none."""
+    root = os.environ.get("MAXTEXT_DATA_POSITIONS_DIR") or self._positions
+    if root is None or not epath.Path(root).exists():
+      return 0, None
+    root = epath.Path(root)
+    for k in sorted((int(d.name) for d in root.iterdir() if d.name.isdigit() and int(d.name) <= n), reverse=True):
+      if len(list((root / str(k)).glob("process_*.json"))) == jax.process_count():
+        record = json.loads((root / str(k) / f"process_{jax.process_index()}.json").read_text())
+        assert record["process_count"] == jax.process_count(), record
+        return k, record["rows"]
+    return 0, None
 
   def _skip_trained_batches(self, train_ctx: peft_trainer.PeftTrainer):
     """On resume, discards the batches the restored checkpoint already trained on.
 
     Tunix skips them itself only when no data hooks are set, and the streaming iterators are not checkpointed, so
-    without this a resumed run replays the data from the start.
+    without this a resumed run replays the data from the start. With a recorded position at step k <= n, each loading
+    process rebuilds its iterator to start after its recorded rows and only steps k+1..n are replayed.
     """
     self._resume_skip_done = True
     n = train_ctx._iter_steps  # pylint: disable=protected-access
+    self._loaded = max(n, 0)
     if n <= 0:
       return
     start = time.perf_counter()
-    for _ in range(n):
+    k, rows = self._find_position(n)
+    if k and hasattr(self.train_data_iterator, "rows_consumed"):
+      assert rows, f"step {k} records no rows for loading process {jax.process_index()}"
+      self.train_data_iterator.close()
+      os.environ["MAXTEXT_DATA_SKIP_ROWS"] = str(rows)
+      try:
+        train_iterator, eval_iterator = create_data_iterator(self.config, self.mesh)
+      finally:
+        del os.environ["MAXTEXT_DATA_SKIP_ROWS"]
+      if eval_iterator is not None and hasattr(eval_iterator, "close"):
+        eval_iterator.close()
+      train_iterator.rows_consumed = rows
+      self.train_data_iterator = self.train_data_loader.data_iterator = train_iterator
+    for _ in range(n - k):
       self.train_data_loader.load_next_batch_pre_sharding()
-    max_logging.log(f"Resume: skipped {n} already-trained batches in {time.perf_counter() - start:.1f}s")
+    max_logging.log(
+        f"Resume: seek to recorded step {k} (rows {rows}), then replayed {n - k} batches, in "
+        f"{time.perf_counter() - start:.1f}s"
+    )
 
   @override
   def load_next_train_batch(self, train_ctx: peft_trainer.PeftTrainer):
@@ -233,6 +288,7 @@ class BaseDataHooks(DataHooks):
       if not self._resume_skip_done:
         self._skip_trained_batches(train_ctx)
       self.train_batch = self.train_data_loader.load_next_batch()
+      self._record_position()
     except Exception as e:  # pylint: disable=broad-exception-caught
       max_logging.log(f"Exception in load_next_train_batch: {str(e)}")
       self.train_batch = None
