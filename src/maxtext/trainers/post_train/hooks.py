@@ -30,6 +30,7 @@ from flax import nnx
 from tunix.sft import peft_trainer
 from tunix.sft.hooks import DataHooks, TrainingHooks
 
+from maxtext.input_pipeline.hf_data_processing import supports_resume_seek
 from maxtext.input_pipeline.input_pipeline_interface import create_data_iterator
 from maxtext.common.data_loader import DataLoader
 from maxtext.common.goodput import GoodputEvent, record_goodput
@@ -219,7 +220,7 @@ class BaseDataHooks(DataHooks):
     self._loaded = 0
     self._position_period = int(os.environ.get("MAXTEXT_DATA_POSITION_PERIOD", "100"))
     self._positions = None
-    if config.dataset_type == "hf" and config.packing and config.checkpoint_dir:
+    if supports_resume_seek(config) and config.checkpoint_dir:
       self._positions = epath.Path(config.checkpoint_dir).parent / "data_positions"
 
   def _record_position(self):
@@ -237,6 +238,8 @@ class BaseDataHooks(DataHooks):
 
   def _find_position(self, n):
     """The largest step <= n that every process recorded, and this process's rows there; (0, None) if none."""
+    if not supports_resume_seek(self.config):
+      return 0, None
     root = os.environ.get("MAXTEXT_DATA_POSITIONS_DIR") or self._positions
     if root is None or not epath.Path(root).exists():
       return 0, None

@@ -575,6 +575,19 @@ def preprocessing_pipeline(
 _R2_EMULATION = os.environ.get("MAXTEXT_R2_DATA_EMULATION", "")
 
 
+def supports_resume_seek(config):
+  """Whether a resume can seek this train loader to a recorded raw-row position: packed text rows through
+  preprocessing_pipeline, with epochs as concatenated shuffles (HFDataSource counts rows from the parquet footers and
+  does not see dataset.repeat). Other loaders replay every trained batch."""
+  return (
+      config.dataset_type == "hf"
+      and config.packing
+      and not _R2_EMULATION
+      and not config.use_multimodal
+      and (config.num_epoch == 1 or config.enable_data_shuffling)
+  )
+
+
 def _batch_sha(batch):
   h = hashlib.sha256()
   for key in sorted(batch):
@@ -668,7 +681,7 @@ def make_hf_train_iterator(
 
   # Set only while hooks.BaseDataHooks rebuilds the train iterator for a resume seek.
   skip_rows = int(os.environ.get("MAXTEXT_DATA_SKIP_ROWS", "0"))
-  assert not (skip_rows and (_R2_EMULATION or config.use_multimodal)), "a resume seek supports the text SFT pipeline"
+  assert not skip_rows or supports_resume_seek(config), "this train loader does not support a resume seek"
   train_ds = datasets.load_dataset(
       config.hf_path,
       name=config.hf_name,
