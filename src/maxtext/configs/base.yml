@@ -276,6 +276,7 @@ emo_max_document_expert_pool: 512
 emo_eval_document_expert_pool: 512
 # With moe_lean_routing, find the EMo pool threshold by bisection instead of a sort.
 emo_threshold_by_bisection: false
+moe_global_load_balancing: false # OLMo-core global_load_balancing: LB counts averaged over the whole batch, not per device
 use_random_routing: false # whether to use random routing for debug/test purpose
 use_custom_sort_vjp: true # whether to use a custom VJP sort for efficient backward pass processing in sparse matmul
 router_topk_matmul_vjp: false # deepseek routing: dense one-hot VJP for the top-k weight gather (no scatter-add in the backward)
@@ -813,6 +814,9 @@ num_vocab_tiling: 1
 # reuses it instead of re-gathering per chunk. Faster when steps are short enough to expose
 # the gathers; holds the gathered head in memory for the backward.
 vocab_tiling_ag_once: false
+# If set to true then cut the vocab tiles along the sequence instead of the flattened batch, so each device keeps
+# its own tokens; the batch-major cut reshards the hidden states through a full all-gather at small per-device batches.
+vocab_tiling_seq_major: false
 
 # Tokenizer
 vocab_size: 32_000 # powers of 2 for sharding

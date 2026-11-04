@@ -15,6 +15,7 @@
 
 """MoE related Layers."""
 
+import contextvars
 import dataclasses
 import enum
 import functools
@@ -52,6 +53,7 @@ from maxtext.utils.sharding import (
     logical_to_mesh_axes,
     maybe_shard_with_logical,
     maybe_shard_with_pspec,
+    mesh_axes_for_dim,
     remove_expert_from_partition_spec,
     remove_incompatible_mesh_axes_from_partition_spec,
     remove_mesh_axes_from_partition_spec,
@@ -61,6 +63,12 @@ import qwix
 from qwix.contrib.sparsity import sparsity_module
 import qwix.pallas as qpl
 import tokamax
+
+# Mesh axes that shard the tokens inside the sparse routed MoE's shard_map, set around that call. A model's
+# load_balance_loss reads it to reduce over the token-sharding axes only (shard_map rejects axes an enclosing vmap
+# mapped away, such as "stage" or "diloco"); None outside the shard_map.
+LB_REDUCE_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_lb_reduce_axes", default=None)
+
 
 set_xla_metadata = xla_metadata.set_xla_metadata
 
@@ -3290,26 +3298,32 @@ class RoutedMoE(nnx.Module):
 
       return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.required_rbf
 
+    in_specs = (
+        input_partition_pspec,
+        gate_logits_pspec,
+        pre_bias_logits_pspec,
+        w0_pspec,
+        w1_pspec,
+        wo_pspec,
+        w0_bias_pspec,
+        w1_bias_pspec,
+        wo_bias_pspec,
+        decoder_tokens_pspec,
+        P(),  # Replicate the input key
+        # Reuse gate_logits_pspec (which forced_routed_experts is sharded
+        # with below); recomputing it would skip
+        # maybe_replicate_incompatible_batch.
+        gate_logits_pspec if forced_routed_experts is not None else None,
+    )
+    # The axes the shard_map's operands are sharded over, for moe_global_load_balancing (LB_REDUCE_AXES). Not every
+    # mesh axis: shard_map rejects axes an enclosing vmap mapped away ("stage", "diloco").
+    input_mesh_axes = {axis for spec in in_specs if spec is not None for dim in spec for axis in mesh_axes_for_dim(dim)}
+    lb_reduce_axes = tuple(axis for axis in self.mesh.axis_names if axis in input_mesh_axes)
+
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
-        in_specs=(
-            input_partition_pspec,
-            gate_logits_pspec,
-            pre_bias_logits_pspec,
-            w0_pspec,
-            w1_pspec,
-            wo_pspec,
-            w0_bias_pspec,
-            w1_bias_pspec,
-            wo_bias_pspec,
-            decoder_tokens_pspec,
-            P(),  # Replicate the input key
-            # Reuse gate_logits_pspec (which forced_routed_experts is sharded
-            # with below); recomputing it would skip
-            # maybe_replicate_incompatible_batch.
-            gate_logits_pspec if forced_routed_experts is not None else None,
-        ),
+        in_specs=in_specs,
         out_specs=(
             output_pspec,
             P(),  # Handle None or replicate the output
@@ -3590,20 +3604,24 @@ class RoutedMoE(nnx.Module):
     if wo_bias is not None:
       wo_bias = _fsdp_all_gather(wo_bias, wo_bias_pspec)
 
-    output, lb_loss, bias_updates, has_overflow, took_fallback, required_rbf = sparse_matmul_route_and_compute(
-        inputs,
-        gate_logits,
-        pre_bias_logits,
-        w0_kernel,
-        w1_kernel,
-        wo_kernel,
-        w0_bias,
-        w1_bias,
-        wo_bias,
-        input_ids,
-        self.rngs,
-        forced_routed_experts,
-    )
+    lb_axes_token = LB_REDUCE_AXES.set(lb_reduce_axes)
+    try:
+      output, lb_loss, bias_updates, has_overflow, took_fallback, required_rbf = sparse_matmul_route_and_compute(
+          inputs,
+          gate_logits,
+          pre_bias_logits,
+          w0_kernel,
+          w1_kernel,
+          wo_kernel,
+          w0_bias,
+          w1_bias,
+          wo_bias,
+          input_ids,
+          self.rngs,
+          forced_routed_experts,
+      )
+    finally:
+      LB_REDUCE_AXES.reset(lb_axes_token)
     self.sow(nnx.Intermediate, "moe_has_overflow", has_overflow)
     if self.config.moe_dropless_fallback == "layer":
       self.sow(nnx.Intermediate, "moe_dropless_fallback", took_fallback)

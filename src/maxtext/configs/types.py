@@ -761,6 +761,12 @@ class LogitsAndLoss(BaseModel):
       False,
       description="All gather the output head weight once before the tiled loss so the backward reuses it.",
   )
+  vocab_tiling_seq_major: bool = Field(
+      False,
+      description="Cut the vocab tiles along the sequence, so every tile holds a slice of each sequence and each"
+      " device keeps its own tokens. The default cuts the flattened batch, which puts a whole sequence in one tile"
+      " and, at one sequence per device, makes XLA reshard the hidden states through a full all-gather.",
+  )
 
 
 class Attention(BaseModel):
@@ -1163,6 +1169,15 @@ class MoEGeneral(BaseModel):
       False,
       description="With moe_lean_routing, find the EMo pool threshold by bisecting on the score bits"
       " (32 counting passes) instead of sorting every token's expert scores.",
+  )
+  moe_global_load_balancing: bool = Field(
+      False,
+      description=(
+          "OLMo-core's global_load_balancing: the load-balancing loss multiplies each device's mean router"
+          " probabilities by expert counts averaged over the whole batch (all-reduced across the batch-sharding"
+          " mesh axes) instead of the device's own counts. The counts carry no gradient. The loss value is then"
+          " the global-batch one on every device."
+      ),
   )
   use_custom_sort_vjp: bool = Field(
       True,
@@ -5280,6 +5295,12 @@ class MaxTextConfig(
         and (self.per_device_batch_size * self.max_target_length) % self.num_vocab_tiling != 0
     ):
       raise ValueError("Per device batch size times sequence length should be divisible by the number of vocab tiles.")
+    if getattr(self, "vocab_tiling_seq_major", False) and self.num_vocab_tiling > 1:
+      if self.max_target_length % self.num_vocab_tiling != 0:
+        raise ValueError(
+            f"vocab_tiling_seq_major cuts the vocab tiles along the sequence, so num_vocab_tiling"
+            f" ({self.num_vocab_tiling}) must divide max_target_length ({self.max_target_length})."
+        )
     context_parallel_size = getattr(self, f"ici_{self.context_sharding}_parallelism", 1) * getattr(
         self, f"dcn_{self.context_sharding}_parallelism", 1
     )
