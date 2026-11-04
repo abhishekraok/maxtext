@@ -243,6 +243,13 @@ class OLMoE3KimiDeltaAttention(nnx.Module):
       # context-sharded sequence shards the scan's chunk axis, and XLA all-gathers every chunk's inputs on each
       # scan iteration (quadratic traffic: 90% of a 64K step at context 2). Gather once per layer instead.
       # Its heads may shard instead (activation_kda_heads; olmo35-ep-as-cp puts them on the context axis).
+      # Reshard in two steps: from (context, expert) on the sequence, first move expert to the heads
+      # (activation_kda_length keeps context on the sequence), then context to the value dim. Done in one step, XLA
+      # all-gathers the full [B, T, H, dv] on every chip.
+      q, k, v, log_decay = (
+          nn.with_logical_constraint(t, ("activation_batch", "activation_kda_length", "activation_kda_heads", None))
+          for t in (q, k, v, log_decay)
+      )
       seq_whole = ("activation_batch", None, "activation_kda_heads", None)
       q, k, log_decay = (nn.with_logical_constraint(t, seq_whole) for t in (q, k, log_decay))
       # The value dimension is independent in the recurrence (state [dk, dv], u, delta and the output all carry it),
@@ -796,9 +803,15 @@ def _delta_rule_chunked_subblock(
     states, delta = n_whole(states, "activation_kda_value"), n_whole(delta, "activation_kda_value")
     states, delta = jnp.moveaxis(states, 0, 2), jnp.moveaxis(delta, 0, 2)  # [B, H, N, ...]
 
+  # Read out per chunk with the chunk axis sharded (activation_kda_chunks; olmo35-cp-ep puts it on the context axis).
+  # Left to propagation, the readout all-gathers every chunk's states and delta over the heads and the value dim.
+  nck = ("activation_batch", "activation_kda_heads", "activation_kda_chunks", None, None)
+  states, delta, scores = (nn.with_logical_constraint(t, nck) for t in (states, delta, scores))
   qg = (q_c.astype(f32) * eg * from_prev).astype(compute_dtype)
+  qg = nn.with_logical_constraint(qg, nck)
   out = jnp.einsum("...cd,...dv->...cv", qg, states, preferred_element_type=f32)
   out = out + jnp.einsum("...ij,...jv->...iv", scores.astype(compute_dtype), delta, preferred_element_type=f32)
+  out = nn.with_logical_constraint(out, nck)
   return out.transpose(0, 2, 3, 1, 4).reshape(batch, seq_len, heads, dv)
 
 

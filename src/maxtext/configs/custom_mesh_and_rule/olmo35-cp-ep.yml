@@ -36,6 +36,8 @@ logical_axis_rules: [
                       ['activation_heads', []],
                       ['activation_kda_heads', ['expert']],
                       ['activation_kda_value', ['context']],
+                      ['activation_kda_length', ['context']],
+                      ['activation_kda_chunks', ['context']],
                       ['activation_kv_heads', []],
                       ['activation_length_attn', ['context', 'expert']],
                       ['activation_q_length', ['context', 'expert']],
