@@ -316,6 +316,7 @@ ModelName = Literal[
     # OLMo 3.5 partner family (allenai/OLMo-core@codex/partner-model-family-20260914).
     "olmo35-tiny",
     "olmo35-small",
+    "olmo35-small-e256k8-sh2x",
     "olmo35-medium",
     "olmo35-large",
     # Scaling ladder for the architecture ablation study; see olmoe3-arch-ablations.md.
