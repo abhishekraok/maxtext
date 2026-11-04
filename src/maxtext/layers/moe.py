@@ -2677,7 +2677,9 @@ class RoutedMoE(nnx.Module):
                 x, dispatch_params, combine_params, buffer_size, x.shape[0], self._expert_parallelism_name, False
             )
           else:
-            output_shape = jax.lax.empty((buffer_size, self.moe_expert_input_dim), dtype=x.dtype)
+            # Rows past the received tokens are never written. Zeros, not jax.lax.empty: stale HBM in those rows
+            # gave nondeterministic NaN loss on the same batch (Olmo 3.5 small, 8x8x8, RBF 3 and 8).
+            output_shape = jnp.zeros((buffer_size, self.moe_expert_input_dim), dtype=x.dtype)
             x = jax.lax.ragged_all_to_all(x, output_shape, *dispatch_params, axis_name=self._expert_parallelism_name)
           global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=self._expert_parallelism_name)
           if self.config.moe_lean_routing and not self.config.use_ragged_sort:
