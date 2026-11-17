@@ -1317,7 +1317,10 @@ class _LiveMixtureHostLoader:
       num_workers: int,
       seed_offset: int = 0,
       initial_batch_step: int = 0,
+      row_slice: Optional[slice] = None,
   ):
+    # Rows of each rank batch this host keeps (None: all). See OLMO_MM_LOADER_WORLD in _make_mm_loader_for_host.
+    self._row_slice = row_slice
     global_batch_tokens = int(per_host_batch) * int(shard_count) * int(max_target_length)
     self._loader, raw_cfg = build_olmo_core_mixture_loader(
         config_path,
@@ -1367,7 +1370,7 @@ class _LiveMixtureHostLoader:
       self._loader.reshuffle()
       self._iter = iter(self._loader)
       raw_batch = next(self._iter)
-    return olmo_core_batch_to_maxtext_batch(
+    out = olmo_core_batch_to_maxtext_batch(
         raw_batch,
         max_target_length=self._max_target_length,
         max_crops_per_seq=self._max_crops,
@@ -1381,6 +1384,32 @@ class _LiveMixtureHostLoader:
         use_loss_weights=self._use_loss_weights,
         include_router_token_mask=True,
     )
+    if self._row_slice is not None:
+      rank_rows = next(iter(out.values())).shape[0]
+      for name, arr in out.items():
+        if arr.shape[0] != rank_rows:
+          raise ValueError(f"OLMO_MM_LOADER_WORLD: {name} has {arr.shape[0]} rows, expected {rank_rows}.")
+      out = {name: np.ascontiguousarray(arr[self._row_slice]) for name, arr in out.items()}
+    return out
+
+
+class _MultiRankHostLoader:
+  """One host reading several consecutive loader ranks; its batch is their batches concatenated in rank order."""
+
+  def __init__(self, loaders):
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+
+    self._loaders = list(loaders)
+    self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(self._loaders))
+
+  def __iter__(self):
+    return self
+
+  def __next__(self) -> dict[str, np.ndarray]:
+    parts = [f.result() for f in [self._pool.submit(next, loader) for loader in self._loaders]]
+    if any(set(p) != set(parts[0]) for p in parts):
+      raise ValueError("OLMO_MM_LOADER_WORLD: rank batches have different fields.")
+    return {name: np.concatenate([p[name] for p in parts], axis=0) for name in parts[0]}
 
 
 def _make_mm_loader_for_host(
@@ -1429,16 +1458,52 @@ def _make_mm_loader_for_host(
         "or config.olmo_mm_config_path (OLMo-core multimodal config.json)."
     )
 
+  # OLMO_MM_LOADER_WORLD=W: read the batches a W-rank run draws (the loader's order is a function of its seed,
+  # rank and world size, and each rank packs its own stream), in the same row order.
+  # W < hosts: host h reads rank h // k of W, k = hosts / W, and keeps its k-th of that rank's rows. For recipes
+  #   whose group_sequence_quotas are multiples of the GPU run's rank count but not of the host count.
+  # W > hosts: host h reads the r = W / hosts ranks h*r .. h*r+r-1, each for per_host_batch / r rows. For stages
+  #   where each loading host carries several of the GPU run's one-sequence ranks (256K mid-training).
+  row_slice = None
+  host_ranks = None
+  loader_world = int(os.environ.get("OLMO_MM_LOADER_WORLD", "0") or 0)
+  if loader_world > 0 and loader_world != shard_count:
+    if shard_count % loader_world == 0:
+      hosts_per_rank = shard_count // loader_world
+      row_start = (shard_index % hosts_per_rank) * per_host_batch
+      row_slice = slice(row_start, row_start + per_host_batch)
+      max_logging.log(
+          f"OLMO_MM_LOADER_WORLD={loader_world}: host shard {shard_index}/{shard_count} reads rank "
+          f"{shard_index // hosts_per_rank}/{loader_world}, rows {row_start}:{row_start + per_host_batch} of "
+          f"{per_host_batch * hosts_per_rank}."
+      )
+      shard_index, shard_count, per_host_batch = shard_index // hosts_per_rank, loader_world, per_host_batch * hosts_per_rank
+    elif loader_world % shard_count == 0 and per_host_batch % (loader_world // shard_count) == 0:
+      ranks_per_host = loader_world // shard_count
+      host_ranks = [shard_index * ranks_per_host + j for j in range(ranks_per_host)]
+      max_logging.log(
+          f"OLMO_MM_LOADER_WORLD={loader_world}: host shard {shard_index}/{shard_count} reads ranks "
+          f"{host_ranks[0]}..{host_ranks[-1]} of {loader_world}, {per_host_batch // ranks_per_host} rows each."
+      )
+      shard_count, per_host_batch = loader_world, per_host_batch // ranks_per_host
+    else:
+      raise ValueError(
+          f"OLMO_MM_LOADER_WORLD={loader_world} must divide the host count {shard_count}, or be a multiple of it "
+          f"whose ranks-per-host divides per_host_batch={per_host_batch}."
+      )
+
   work_dir = (getattr(config, "olmo_mm_work_dir", "") or "/tmp/olmo_mm_work").strip()
   max_logging.log(
       f"OLMo MM live MixtureDataLoader: config={cfg_path} work_dir={work_dir} shard={shard_index}/{shard_count} "
       f"per_host_batch={per_host_batch} seq={config.max_target_length} crops={n_crops} pooled={n_pooled} "
       f"resumed_step={resumed_step}"
   )
-  return _LiveMixtureHostLoader(
+  def build_live(rank):
+    return _LiveMixtureHostLoader(
+      row_slice=row_slice,
       config_path=cfg_path,
       work_dir=work_dir,
-      shard_index=shard_index,
+      shard_index=rank,
       shard_count=shard_count,
       per_host_batch=per_host_batch,
       max_target_length=config.max_target_length,
@@ -1456,7 +1521,11 @@ def _make_mm_loader_for_host(
       num_workers=int(getattr(config, "olmo_mm_num_workers", 0)),
       seed_offset=0x1F1F1F1F if is_eval else 0,
       initial_batch_step=resumed_step,
-  )
+    )
+
+  if host_ranks is None:
+    return build_live(shard_index)
+  return _MultiRankHostLoader([build_live(rank) for rank in host_ranks])
 
 
 def make_olmo_mm_train_iterator(config, global_mesh, process_indices):
