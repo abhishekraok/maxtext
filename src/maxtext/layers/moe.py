@@ -3247,6 +3247,15 @@ class RoutedMoE(nnx.Module):
 
       return output, routing.lb_loss, routing.bias_updates, routing.has_overflow, routing.required_rbf
 
+    if self.config.emo_enabled and self.config.emo_causal_pool and forced_routed_experts is None:
+      if input_ids is None:
+        raise ValueError("Causal EMo requires packed document segment ids.")
+      # Select experts over full documents before the shard map assigns their
+      # IDs the same batch and sequence sharding as the live router logits.
+      _, forced_routed_experts = self.get_topk(
+          jax.lax.stop_gradient(gate_logits), pre_bias_logits, self.rngs, input_ids
+      )
+
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
@@ -3506,15 +3515,6 @@ class RoutedMoE(nnx.Module):
         pre_bias_logits_pspec,
         logical_axes=pre_bias_logits_logical_axes,
     )
-    if self.config.emo_enabled and self.config.emo_causal_pool and forced_routed_experts is None:
-      if input_ids is None:
-        raise ValueError("Causal EMo requires packed document segment ids.")
-      # Compute one pool draw and its causal prefix over each full document before
-      # shard_map slices the sequence. Dispatch still gathers the live logits for
-      # the selected experts, so their weights and gradients use the usual path.
-      _, forced_routed_experts = self.get_topk(
-          jax.lax.stop_gradient(gate_logits), pre_bias_logits, self.rngs, input_ids
-      )
     if forced_routed_experts is not None:
       forced_routed_experts = self._maybe_shard_with_pspec(
           forced_routed_experts,
