@@ -271,6 +271,7 @@ moe_aux_loss_reduction: mean # 'mean' (MaxText: weight x average over MoE layers
 # EMo document-pool routing (OLMoE3): restrict each document's top-k to a per-document
 # expert pool (size sampled from [min, max] in training, fixed at eval). arxiv 2605.06663
 emo_enabled: false
+emo_causal_pool: false # rank experts by the document prefix through the current token
 emo_min_document_expert_pool: 16
 emo_max_document_expert_pool: 512
 emo_eval_document_expert_pool: 512

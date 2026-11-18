@@ -1145,6 +1145,9 @@ class MoEGeneral(BaseModel):
       False,
       description="EMo document-pool routing (OLMoE3): restrict each packed document's top-k to a per-document expert pool.",
   )
+  emo_causal_pool: bool = Field(
+      False, description="Rank each token's expert pool using its document prefix through that token."
+  )
   emo_min_document_expert_pool: int = Field(
       16, description="Smallest EMo training pool size (must be >= num_experts_per_tok)."
   )

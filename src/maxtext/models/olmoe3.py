@@ -916,7 +916,8 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
     tokens' full-softmax scores, keeps its top ``pool`` experts by that total,
     and every token of the document then routes within the pool. ``pool`` is
     sampled uniformly from [emo_min, emo_max] per document during training and
-    fixed at ``emo_eval_document_expert_pool`` otherwise.
+    fixed at ``emo_eval_document_expert_pool`` otherwise. Causal pools rank
+    experts by each token's document prefix, including that token.
 
     MaxText packs documents contiguously, so the per-document score totals are
     cumulative-sum differences at document boundaries rather than a scatter
@@ -931,18 +932,19 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
     positions = jnp.arange(seq_len)
     prev_ids = jnp.pad(segment_ids, ((0, 0), (1, 0)), constant_values=-1)[:, :seq_len]
     is_first = segment_ids != prev_ids  # position 0 always starts a document
-    next_ids = jnp.pad(segment_ids, ((0, 0), (0, 1)), constant_values=-1)[:, 1:]
-    is_last = segment_ids != next_ids  # the final position always ends one
-
     start = jax.lax.cummax(jnp.where(is_first, positions, 0), axis=1)
-    end = jnp.flip(jax.lax.cummin(jnp.flip(jnp.where(is_last, positions, seq_len), axis=1), axis=1), axis=1)
-
     scores = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1)
     csum = jnp.cumsum(scores, axis=1)
-    csum_end = jnp.take_along_axis(csum, end[..., None], axis=1)
     before = jnp.take_along_axis(csum, jnp.maximum(start - 1, 0)[..., None], axis=1)
     csum_before = jnp.where((start == 0)[..., None], 0.0, before)
-    document_scores = csum_end - csum_before  # [b, s, E]: each token sees its document's totals
+    if cfg.emo_causal_pool:
+      document_scores = csum - csum_before
+    else:
+      next_ids = jnp.pad(segment_ids, ((0, 0), (0, 1)), constant_values=-1)[:, 1:]
+      is_last = segment_ids != next_ids
+      end = jnp.flip(jax.lax.cummin(jnp.flip(jnp.where(is_last, positions, seq_len), axis=1), axis=1), axis=1)
+      csum_end = jnp.take_along_axis(csum, end[..., None], axis=1)
+      document_scores = csum_end - csum_before
 
     if rngs is not None and cfg.model_call_mode != "inference":
       rng = rngs.params() if hasattr(rngs, "params") and callable(getattr(rngs, "params")) else rngs
@@ -1003,6 +1005,10 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
   def __init__(self, *args, gate_in_features: int, **kwargs):
     super().__init__(*args, **kwargs)
     cfg = self.config
+    if cfg.emo_causal_pool and not cfg.emo_enabled:
+      raise ValueError("Causal EMo requires emo_enabled.")
+    if cfg.emo_causal_pool and cfg.ici_context_parallelism > 1 and cfg.context_parallel_load_balance:
+      raise ValueError("Causal EMo requires document order within a packed row.")
     if cfg.emo_enabled:
       if cfg.emo_min_document_expert_pool < self.num_experts_per_tok:
         raise ValueError("emo_min_document_expert_pool must be >= num_experts_per_tok.")
