@@ -266,6 +266,45 @@ class OLMo35ViTBlock(nnx.Module):
     return x
 
 
+def _balanced_crop_tables(b_dim: int, n_crops: int, m_batch: int, m_cp: int, shifts: list[int]) -> dict[str, np.ndarray]:
+  """Static all-to-all tables between the ``[B, N]`` crop layout and the balanced ``[M, B * J]`` one.
+
+  Device ``s = fb * m_cp + e`` holds rows ``fb * B_loc ...`` and crops ``e * N_loc ...`` of the ``[B, N]`` layout.
+  Crop ``c`` of row ``b`` belongs to device ``d = (c % M + shifts[b]) % M``, slot ``b * J + c // M``. Every source
+  sends ``K`` (padded) crops to every device. ``send[s]``: local crop per (dest, k), ``B_loc * N_loc`` = zero pad;
+  ``recv[d]``: per slot, its ``source * K + k``; ``back[d]``: slot per (source, k), ``B * J`` = zero pad;
+  ``src[s]``: per local crop, its ``dest * K + k``.
+  """
+  m = m_batch * m_cp
+  b_loc, n_loc, j_dim = b_dim // m_batch, n_crops // m_cp, n_crops // m
+  slots = b_dim * j_dim
+  pairs: dict[tuple[int, int], list[tuple[int, int]]] = {}
+  for b in range(b_dim):
+    fb, bl = divmod(b, b_loc)
+    for c in range(n_crops):
+      e, i = divmod(c, n_loc)
+      src = fb * m_cp + e
+      dst = (c % m + shifts[b]) % m
+      pairs.setdefault((src, dst), []).append((bl * n_loc + i, b * j_dim + c // m))
+  k_max = max(len(v) for v in pairs.values())
+  send = np.full((m, m, k_max), b_loc * n_loc, dtype=np.int32)
+  back = np.full((m, m, k_max), slots, dtype=np.int32)
+  recv = np.zeros((m, slots), dtype=np.int32)
+  src_t = np.zeros((m, b_loc * n_loc), dtype=np.int32)
+  for (src, dst), items in pairs.items():
+    for k, (local, slot) in enumerate(items):
+      send[src, dst, k] = local
+      back[dst, src, k] = slot
+      recv[dst, slot] = src * k_max + k
+      src_t[src, local] = dst * k_max + k
+  return {
+      "send": send.reshape(m, m * k_max),
+      "back": back.reshape(m, m * k_max),
+      "recv": recv,
+      "src": src_t,
+  }
+
+
 class OLMo35VisionEncoder(nnx.Module):
   """SigLIP2-SO400M/14-378 25-block vision tower returning concatenated multi-layer features."""
 
@@ -410,11 +449,15 @@ class OLMo35VisionEncoder(nnx.Module):
     batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
     cp_axis = self.config.context_sharding
     bt = tuple(batch_axes) if isinstance(batch_axes, (tuple, list)) else ((batch_axes,) if batch_axes else ())
-    dev_axes = tuple(dict.fromkeys((*bt, cp_axis)))
-    m = 1
-    for a in dev_axes:
-      m *= int(self.mesh.shape.get(a, 1))
-    if m <= 1 or chunk <= 0 or n_crops % m != 0:
+    dev_axes = (*bt, cp_axis)
+    if cp_axis in bt:
+      return None
+    m_batch = 1
+    for a in bt:
+      m_batch *= int(self.mesh.shape.get(a, 1))
+    m_cp = int(self.mesh.shape.get(cp_axis, 1))
+    m = m_batch * m_cp
+    if m <= 1 or chunk <= 0 or n_crops % m != 0 or b_dim % m_batch != 0:
       return None
     j_dim = n_crops // m
     slots = b_dim * j_dim
@@ -441,13 +484,38 @@ class OLMo35VisionEncoder(nnx.Module):
     inv_order = jnp.argsort(order, axis=1).astype(jnp.int32)
     k_max = jnp.max(jnp.sum(valid.astype(jnp.int32), axis=1))
 
-    # [B, N] -> [B, J, M] -> per-row roll over M -> [M, B * J] on all devices.
-    x = patches.reshape(b_dim, j_dim, m, p, d_in)
-    x = jnp.stack([jnp.roll(x[b], shifts[b], axis=1) if shifts[b] else x[b] for b in range(b_dim)], axis=0)
-    y = jnp.transpose(x, (2, 0, 1, 3, 4)).reshape(m, slots, p, d_in)
-    y = sharding.maybe_shard_with_pspec(y, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    # Move crops between the [B, N] (batch x context) layout and the [M, B * J] layout with one all-to-all each way.
+    tabs = _balanced_crop_tables(b_dim, n_crops, m_batch, m_cp, shifts)
+    in_spec = PartitionSpec(batch_axes, cp_axis, None, None)
+    bal_spec = PartitionSpec(dev_spec, None, None, None)
+
+    def _lin_index():
+      lin = 0
+      for a in dev_axes:
+        lin = lin * int(self.mesh.shape[a]) + jax.lax.axis_index(a)
+      return lin
+
+    def _to_balanced(x_loc):
+      me = _lin_index()
+      flat = x_loc.reshape(-1, p, d_in)
+      flat = jnp.concatenate([flat, jnp.zeros((1, p, d_in), flat.dtype)], axis=0)
+      send = jnp.take(flat, jnp.asarray(tabs["send"])[me], axis=0)
+      recv = jax.lax.all_to_all(send, dev_axes, 0, 0, tiled=True)
+      return jnp.take(recv, jnp.asarray(tabs["recv"])[me], axis=0)[None]
+
+    def _from_balanced(f_loc):
+      me = _lin_index()
+      f = f_loc[0]
+      f = jnp.concatenate([f, jnp.zeros((1,) + f.shape[1:], f.dtype)], axis=0)
+      send = jnp.take(f, jnp.asarray(tabs["back"])[me], axis=0)
+      recv = jax.lax.all_to_all(send, dev_axes, 0, 0, tiled=True)
+      out = jnp.take(recv, jnp.asarray(tabs["src"])[me], axis=0)
+      return out.reshape(b_dim // m_batch, (n_crops // m_cp) * p, f.shape[-1])
+
+    y = jax.shard_map(_to_balanced, mesh=self.mesh, in_specs=in_spec, out_specs=bal_spec, check_vma=False)(patches)
+    y = sharding.maybe_shard_with_pspec(y, bal_spec, self.mesh, sm)
     y = jnp.take_along_axis(y, order[:, :, None, None], axis=1)
-    y = sharding.maybe_shard_with_pspec(y, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    y = sharding.maybe_shard_with_pspec(y, bal_spec, self.mesh, sm)
     chunked = jnp.transpose(y.reshape(m, n_chunks, chunk, p, d_in), (1, 0, 2, 3, 4))
 
     remat = bool(self.config.olmo_vit_remat_blocks)
@@ -475,14 +543,12 @@ class OLMo35VisionEncoder(nnx.Module):
     _, out_chunks = jax.lax.scan(scan_fn, state, (chunked, jnp.arange(n_chunks, dtype=jnp.int32)))
     f_dim = out_aval.shape[-1]
     feats = jnp.transpose(out_chunks, (1, 0, 2, 3, 4)).reshape(m, slots, p, f_dim)
-    feats = sharding.maybe_shard_with_pspec(feats, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    feats = sharding.maybe_shard_with_pspec(feats, bal_spec, self.mesh, sm)
     feats = jnp.take_along_axis(feats, inv_order[:, :, None, None], axis=1)
     feats = jnp.where(valid[:, :, None, None], feats, jnp.zeros((), feats.dtype))
-    feats = sharding.maybe_shard_with_pspec(feats, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
-    # Back to [B, N * P, F]: [M, B, J] -> [B, J, M] -> undo the per-row roll.
-    f = jnp.transpose(feats.reshape(m, b_dim, j_dim, p, f_dim), (1, 2, 0, 3, 4))
-    f = jnp.stack([jnp.roll(f[b], -shifts[b], axis=1) if shifts[b] else f[b] for b in range(b_dim)], axis=0)
-    return f.reshape(b_dim, n_crops * p, f_dim)
+    feats = sharding.maybe_shard_with_pspec(feats, bal_spec, self.mesh, sm)
+    out_spec = PartitionSpec(batch_axes, cp_axis, None)
+    return jax.shard_map(_from_balanced, mesh=self.mesh, in_specs=bal_spec, out_specs=out_spec, check_vma=False)(feats)
 
   def __call__(
       self, input_images: jax.Array, deterministic: bool = True, pooled_patches_idx: jax.Array | None = None
