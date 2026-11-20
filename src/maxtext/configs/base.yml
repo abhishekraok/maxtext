@@ -1690,6 +1690,10 @@ olmo_connector_warmup_steps: -1
 olmo_hold_final_lr: false
 olmo_per_component_grad_clip: false
 olmo_trainable_embedding_row_range: []
+olmo_clip_embeddings_with_lm: false # with olmo_per_component_grad_clip: clip token_embedder with the decoder (multimodal SFT)
+olmo_router_loss_divisor: 'valid_tokens' # 'loss_tokens': router aux losses over the loss weight sum (OLMo-core SFT)
+log_loss_parts: false # pre_train: LOSS-PARTS line per step on host 0
+olmo_seed_token_rows: [] # fresh runs: [[target, src, ...], ...] embedding/LM-head rows set to the mean of src rows
 
 ### llama4 multi modal configs
 hidden_size_for_vit: 1408

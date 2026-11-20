@@ -1123,8 +1123,14 @@ def build_olmo_core_mixture_loader(
     num_workers: int = 0,
     batch_prefetch_depth: Optional[int] = None,
     seed_offset: int = 0,
+    dataset: Any = None,
 ) -> Tuple[Any, dict[str, Any]]:
-  """Build a live ``OLMo-core`` ``MixtureDataLoader`` from a serialized experiment ``config.json``."""
+  """Build a live ``OLMo-core`` ``MixtureDataLoader`` from a serialized experiment ``config.json``.
+
+  ``dataset``: an already built ``MultimodalDatasetMixture`` of the same config (see
+  :func:`build_olmo_core_mixture_dataset`), shared by the loaders of several ranks on one host instead of building the
+  sources once per rank.
+  """
   if path_remap_from and path_remap_to:
     install_path_remap_prefix(path_remap_from, path_remap_to)
   register_merged_mt_lc_shim()
@@ -1164,9 +1170,9 @@ def build_olmo_core_mixture_loader(
     in_flight_cap = max(16, int(num_workers) * 4) if seq_len_cfg >= 65536 else max(32, int(num_workers) * 16)
     dl_dict["prefetch_max_in_flight"] = min(int(dl_dict.get("prefetch_max_in_flight") or in_flight_cap), in_flight_cap)
 
-  ds_cfg = MultimodalMixtureConfig.from_dict(ds_dict)
   dl_cfg = MixtureDataLoaderConfig.from_dict(dl_dict)
-  dataset = ds_cfg.build()
+  if dataset is None:
+    dataset = MultimodalMixtureConfig.from_dict(ds_dict).build()
   dp_world = int(shard_count)
   dp_rank = int(shard_index)
   if dp_world == 1 and dp_rank == 0:
@@ -1227,6 +1233,53 @@ def build_olmo_core_mixture_loader(
     )
   loader.reshuffle(epoch=1)
   return loader, raw_cfg
+
+
+def build_olmo_core_mixture_dataset(
+    config_path: str | os.PathLike[str] | epath.Path,
+    *,
+    work_dir: str,
+    path_remap_from: str = "",
+    path_remap_to: str = "",
+) -> Any:
+  """Build the ``MultimodalDatasetMixture`` of a serialized ``OLMo-core`` experiment config once (all ranks share it)."""
+  if path_remap_from and path_remap_to:
+    install_path_remap_prefix(path_remap_from, path_remap_to)
+  register_merged_mt_lc_shim()
+  from olmo_core.data.multimodal.alignment import MultimodalMixtureConfig  # pylint: disable=import-outside-toplevel
+
+  raw_cfg = json.loads(epath.Path(config_path).read_text())
+  if path_remap_from and path_remap_to:
+    raw_cfg = remap_paths_in_obj(raw_cfg, path_remap_from, path_remap_to)
+  Path(work_dir).mkdir(parents=True, exist_ok=True)
+  ds_dict = _set_work_dirs_recursive(dict(raw_cfg["dataset"]), work_dir)
+  return MultimodalMixtureConfig.from_dict(ds_dict).build()
+
+
+def resolve_olmo_mm_config_path(cfg_path: str) -> str:
+  """``olmo_mm_config_path`` as given, or, when it is a relative path that does not exist, relative to MaxText's
+  ``configs`` directory (configs shipped with MaxText, e.g. ``olmo/olmo_mm/<run>_config.json``)."""
+  if not cfg_path or "://" in cfg_path or os.path.isabs(cfg_path) or os.path.exists(cfg_path):
+    return cfg_path
+  from maxtext import configs as _configs  # pylint: disable=import-outside-toplevel
+
+  candidate = os.path.join(os.path.dirname(os.path.abspath(_configs.__file__)), cfg_path)
+  return candidate if os.path.exists(candidate) else cfg_path
+
+
+def host_loaded_global_rows(global_mesh, global_batch_size_to_load: int, max_target_length: int) -> List[int]:
+  """Global batch rows this host loads, in local batch order.
+
+  ``multihost_dataloading._form_global_array`` splits the local batch over ``global_mesh.local_devices`` in order and
+  lays the global array out on ``P(mesh.axis_names)``; this is the inverse map (as ``hf_data_processing``'s
+  ``local_rows_trained``).
+  """
+  sharding = jax.sharding.NamedSharding(global_mesh, jax.sharding.PartitionSpec(global_mesh.axis_names))
+  indices = sharding.devices_indices_map((int(global_batch_size_to_load), int(max_target_length)))
+  rows: List[int] = []
+  for d in global_mesh.local_devices:
+    rows += list(range(*indices[d][0].indices(int(global_batch_size_to_load))))
+  return rows
 
 
 class _PreExportedNpzHostLoader:
@@ -1318,6 +1371,7 @@ class _LiveMixtureHostLoader:
       seed_offset: int = 0,
       initial_batch_step: int = 0,
       row_slice: Optional[slice] = None,
+      dataset: Any = None,
   ):
     # Rows of each rank batch this host keeps (None: all). See OLMO_MM_LOADER_WORLD in _make_mm_loader_for_host.
     self._row_slice = row_slice
@@ -1332,6 +1386,7 @@ class _LiveMixtureHostLoader:
         global_batch_tokens=global_batch_tokens,
         num_workers=num_workers,
         seed_offset=seed_offset,
+        dataset=dataset,
     )
     tm_pad_id = raw_cfg.get("train_module", {}).get("padding_input_token_id")
     if int(padding_input_token_id) >= 0:
@@ -1412,11 +1467,58 @@ class _MultiRankHostLoader:
     return {name: np.concatenate([p[name] for p in parts], axis=0) for name in parts[0]}
 
 
+class _TrainedRowsHostLoader:
+  """A host's local batch when ``per_device_batch_size < 1``: only rows the loss trains on carry data.
+
+  With a fractional per-device batch every device still loads rows, and the train step keeps the first
+  ``global_batch_size_to_train_on`` rows of the global batch (``pre_train/train.py`` ``loss_fn``; with gradient
+  accumulation the micro-batches interleave rows, so the trained rows are still ``[0, global_batch_size_to_train_on)``).
+  Those trained rows are the batch of a ``loader_world``-rank ``OLMo-core`` run (default: one rank per trained row,
+  i.e. the GPU run's ranks when it ran one sequence per rank): global row ``r`` is row ``r % rows_per_rank`` of rank
+  ``r // rows_per_rank``. Each host builds the loaders of the ranks whose rows it holds and fills its other rows
+  with zeros (the loss slices them off), so the ``OLMo-core`` stream advances by exactly one global batch per step.
+  """
+
+  def __init__(self, local_rows: List[int], cutoff: int, rows_per_rank: int, rank_loaders: dict):
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+
+    self._local_rows = list(local_rows)
+    self._cutoff = int(cutoff)
+    self._rows_per_rank = int(rows_per_rank)
+    self._ranks = sorted(rank_loaders)
+    self._loaders = dict(rank_loaders)
+    self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self._ranks)))
+
+  def __iter__(self):
+    return self
+
+  def __next__(self) -> dict[str, np.ndarray]:
+    futures = {rank: self._pool.submit(next, self._loaders[rank]) for rank in self._ranks}
+    parts = {rank: f.result() for rank, f in futures.items()}
+    template = parts[self._ranks[0]]
+    if any(set(p) != set(template) for p in parts.values()):
+      raise ValueError("olmo_mm: rank batches have different fields.")
+    out = {}
+    for name, ref in template.items():
+      fill = -1 if name == "pooled_patches_idx" else 0
+      arr = np.full((len(self._local_rows),) + ref.shape[1:], fill, dtype=ref.dtype)
+      for i, row in enumerate(self._local_rows):
+        if row < self._cutoff:
+          rank, offset = divmod(row, self._rows_per_rank)
+          src = parts[rank][name]
+          if src.shape[0] != self._rows_per_rank:
+            raise ValueError(f"olmo_mm: rank {rank} {name} has {src.shape[0]} rows, expected {self._rows_per_rank}.")
+          arr[i] = src[offset]
+      out[name] = arr
+    return out
+
+
 def _make_mm_loader_for_host(
     config,
     *,
     process_indices: List[int],
     is_eval: bool = False,
+    global_mesh=None,
 ):
   this_proc = jax.process_index()
   shard_index = process_indices.index(this_proc)
@@ -1433,7 +1535,7 @@ def _make_mm_loader_for_host(
   resumed_step = 0 if is_eval else _detect_resumed_step(config)
 
   batches_dir = (getattr(config, "olmo_mm_batches_dir", "") or "").strip()
-  cfg_path = (getattr(config, "olmo_mm_config_path", "") or "").strip()
+  cfg_path = resolve_olmo_mm_config_path((getattr(config, "olmo_mm_config_path", "") or "").strip())
   if batches_dir:
     max_logging.log(
         f"OLMo MM pre-exported batch loader: dir={batches_dir} shard={shard_index}/{shard_count} "
@@ -1457,6 +1559,60 @@ def _make_mm_loader_for_host(
         "When dataset_type=olmo_mm, set either config.olmo_mm_batches_dir (pre-exported .npz batches) "
         "or config.olmo_mm_config_path (OLMo-core multimodal config.json)."
     )
+
+  cutoff = int(config.global_batch_size_to_train_on if not is_eval else config.micro_batch_size_to_eval_on)
+  if global_mesh is not None and cutoff < global_load:
+    # per_device_batch_size < 1: only rows [0, cutoff) of each loaded global batch are trained (see
+    # _TrainedRowsHostLoader). OLMO_MM_LOADER_WORLD=W (default: cutoff) is the OLMo-core run's rank count.
+    loader_world = int(os.environ.get("OLMO_MM_LOADER_WORLD", "0") or 0) or cutoff
+    if cutoff % loader_world != 0:
+      raise ValueError(f"OLMO_MM_LOADER_WORLD={loader_world} must divide the trained rows per step ({cutoff}).")
+    rows_per_rank = cutoff // loader_world
+    local_rows = host_loaded_global_rows(global_mesh, global_load, config.max_target_length)
+    if len(local_rows) != per_host_batch:
+      raise ValueError(f"olmo_mm: host holds {len(local_rows)} rows of the loaded batch, expected {per_host_batch}.")
+    ranks = sorted({row // rows_per_rank for row in local_rows if row < cutoff})
+    if not ranks:
+      raise ValueError(f"olmo_mm: host {this_proc} was chosen to load data but holds no trained row.")
+    work_dir = (getattr(config, "olmo_mm_work_dir", "") or "/tmp/olmo_mm_work").strip()
+    remap_from = getattr(config, "olmo_path_remap_from", "") or ""
+    remap_to = getattr(config, "olmo_path_remap_to", "") or ""
+    max_logging.log(
+        f"OLMo MM live MixtureDataLoader (trained rows): config={cfg_path} work_dir={work_dir} host={this_proc} "
+        f"loads global rows {local_rows} (trained: rows < {cutoff}); OLMo-core ranks {ranks} of {loader_world}, "
+        f"{rows_per_rank} row(s) each; seq={config.max_target_length} crops={n_crops} pooled={n_pooled} "
+        f"resumed_step={resumed_step}"
+    )
+    dataset = build_olmo_core_mixture_dataset(
+        cfg_path, work_dir=work_dir, path_remap_from=remap_from, path_remap_to=remap_to
+    )
+    rank_loaders = {
+        rank: _LiveMixtureHostLoader(
+            config_path=cfg_path,
+            work_dir=work_dir,
+            shard_index=rank,
+            shard_count=loader_world,
+            per_host_batch=rows_per_rank,
+            max_target_length=config.max_target_length,
+            max_crops_per_seq=n_crops,
+            max_pooled_patches_per_seq=n_pooled,
+            n_patches_per_crop=n_patches,
+            patch_dim=patch_dim,
+            pool_size=pool_size,
+            dtype_mm=config.dtype_mm,
+            reset_positions_on_segment=bool(getattr(config, "olmo_reset_positions_on_segment", True)),
+            padding_input_token_id=int(getattr(config, "olmo_mm_padding_input_token_id", -1)),
+            use_loss_weights=use_loss_weights,
+            path_remap_from=remap_from,
+            path_remap_to=remap_to,
+            num_workers=int(getattr(config, "olmo_mm_num_workers", 0)),
+            seed_offset=0x1F1F1F1F if is_eval else 0,
+            initial_batch_step=resumed_step,
+            dataset=dataset,
+        )
+        for rank in ranks
+    }
+    return _TrainedRowsHostLoader(local_rows, cutoff, rows_per_rank, rank_loaders)
 
   # OLMO_MM_LOADER_WORLD=W: read the batches a W-rank run draws (the loader's order is a function of its seed,
   # rank and world size, and each rank packs its own stream), in the same row order.
@@ -1530,7 +1686,7 @@ def _make_mm_loader_for_host(
 
 def make_olmo_mm_train_iterator(config, global_mesh, process_indices):
   """Train iterator for ``dataset_type=olmo_mm``."""
-  loader = _make_mm_loader_for_host(config, process_indices=process_indices, is_eval=False)
+  loader = _make_mm_loader_for_host(config, process_indices=process_indices, is_eval=False, global_mesh=global_mesh)
   return multihost_dataloading.MultiHostDataLoadIterator(
       loader,
       global_mesh,
@@ -1541,7 +1697,7 @@ def make_olmo_mm_train_iterator(config, global_mesh, process_indices):
 
 def make_olmo_mm_eval_iterator(config, global_mesh, process_indices):
   """Eval iterator for ``dataset_type=olmo_mm``."""
-  loader = _make_mm_loader_for_host(config, process_indices=process_indices, is_eval=True)
+  loader = _make_mm_loader_for_host(config, process_indices=process_indices, is_eval=True, global_mesh=global_mesh)
   return multihost_dataloading.MultiHostDataLoadIterator(
       loader,
       global_mesh,

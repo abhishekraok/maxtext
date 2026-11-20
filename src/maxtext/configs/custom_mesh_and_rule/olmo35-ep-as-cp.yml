@@ -82,4 +82,7 @@ logical_axis_rules: [
                       ['layers', 'stage'],
                       ['embed', ['fsdp', 'expert']],
                       ['embed_attn', ['fsdp', 'expert']],
+                      # OLMo 3.5 vision tower and connector kernels (olmoe3_vision._vit_kernel_axes), as cp-as-ep.
+                      ['vit_embed_cp', ['fsdp', 'expert']],
+                      ['vit_embed', ['fsdp', 'expert']],
                   ]

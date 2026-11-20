@@ -491,6 +491,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       if "router_token_mask" in data and data["router_token_mask"] is not None:
         valid_router_tokens = jnp.maximum(jnp.sum(data["router_token_mask"].astype(jnp.float32)), 1.0)
         moe_lb_loss = moe_lb_loss * (jnp.asarray(data["inputs"].size, dtype=jnp.float32) / valid_router_tokens)
+      else:
+        valid_router_tokens = jnp.asarray(data["inputs"].size, dtype=jnp.float32)
+      if getattr(config, "olmo_router_loss_divisor", "valid_tokens") == "loss_tokens" and not is_block_diffusion:
+        # OLMo-core router_loss_divisor="loss_tokens" (the SFT recipes): the router losses' per-token sums are divided
+        # by the loss weight sum (the CE denominator) instead of the valid tokens.
+        moe_lb_loss = moe_lb_loss * (valid_router_tokens / jnp.maximum(jnp.asarray(total_weights, jnp.float32), 1.0))
       loss = _add_aux_loss(loss, moe_lb_loss)
     else:
       max_logging.debug("\nNo MoE load balance loss found. Defaulting to 0.0.")
@@ -839,6 +845,13 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           )
           if (row_range and len(row_range) == 2)
           else (
+              # Multimodal SFT (olmo_clip_embeddings_with_lm): the embeddings share the decoder's scheduler group.
+              lambda s: "OLMo35VisionConnector" in s,
+              lambda s: "OLMo35VisionEncoder" in s,
+              lambda s: ("OLMo35VisionConnector" not in s) and ("OLMo35VisionEncoder" not in s),
+          )
+          if getattr(config, "olmo_clip_embeddings_with_lm", False)
+          else (
               lambda s: "OLMo35VisionConnector" in s,
               lambda s: "OLMo35VisionEncoder" in s,
               lambda s: "token_embedder" in s,
@@ -1113,6 +1126,70 @@ def _maybe_log_required_rbf(config, step, metrics, program):
     max_logging.log(line)
 
 
+def seed_token_rows(model, rows):
+  """olmo_seed_token_rows: each target row of the input embedding and the untied LM head becomes the mean of its
+  source rows (OLMo-core seed_token_rows_from_pieces; all sources read before any target is written).
+
+  The embedding is [vocab, embed] (rows); the LM head kernel is [embed, vocab] (columns). Values are written in the
+  parameter's dtype and keep its sharding. Returns the names of the parameters written.
+  """
+  rows = [(int(r[0]), [int(i) for i in r[1:]]) for r in rows]
+  if any(not src for _, src in rows) or len({t for t, _ in rows}) != len(rows):
+    raise ValueError(f"olmo_seed_token_rows: each entry is [target, source, ...] with a unique target, got {rows}.")
+  written = []
+  for path, var in nnx.iter_graph(model):
+    if not isinstance(var, nnx.Param):
+      continue
+    name = "/".join(str(p) for p in path)
+    if name.endswith("token_embedder/embedding"):
+      axis = 0
+    elif name.endswith("logits_dense/kernel"):
+      axis = 1
+    else:
+      continue
+    value = var.value
+    if value.ndim != 2:
+      raise ValueError(f"olmo_seed_token_rows: {name} has shape {value.shape}, expected a matrix.")
+    full = jnp.moveaxis(value, axis, 0).astype(jnp.float32)
+    means = [jnp.mean(full[jnp.asarray(src)], axis=0) for _, src in rows]
+    for (target, _), mean in zip(rows, means):
+      full = full.at[target].set(mean)
+    new_value = jnp.moveaxis(full, 0, axis).astype(value.dtype)
+    var.value = jax.device_put(new_value, value.sharding) if hasattr(value, "sharding") else new_value
+    written.append(name)
+  if not written:
+    raise ValueError("olmo_seed_token_rows: found no token_embedder/embedding or logits_dense/kernel parameter.")
+  max_logging.log(f"olmo_seed_token_rows: seeded {rows} in {written}")
+  return written
+
+
+_PENDING_LOSS_PARTS = []
+
+
+def _maybe_log_loss_parts(config, step, metrics):
+  """log_loss_parts: one LOSS-PARTS line per step on host 0, as the SFT trainer logs it (step is 1-based).
+
+  A step's line is written after the next step is dispatched (and the last step's at once), so reading the scalars
+  does not wait for the device and the next batch still loads while this step runs.
+  """
+  if not getattr(config, "log_loss_parts", False) or jax.process_index() != 0:
+    return
+  _PENDING_LOSS_PARTS.append((step, {k: metrics["scalar"][k] for k in ("learning/lm_loss", "learning/z_loss",
+                                                                      "learning/moe_lb_loss", "learning/total_weights")
+                                     if k in metrics.get("scalar", {})}))
+  while len(_PENDING_LOSS_PARTS) > 1 or (_PENDING_LOSS_PARTS and step >= config.steps - 1):
+    _log_loss_parts_line(*_PENDING_LOSS_PARTS.pop(0))
+
+
+def _log_loss_parts_line(step, scalars):
+  """Writes one LOSS-PARTS line from a step's scalar metrics (fetches them)."""
+  vals = jax.device_get(scalars)
+  lm, z = float(vals.get("learning/lm_loss", 0.0)), float(vals.get("learning/z_loss", 0.0))
+  lb, weights = float(vals.get("learning/moe_lb_loss", 0.0)), float(vals.get("learning/total_weights", 0.0))
+  # lm_loss includes the z-loss (cross_entropy_with_logits adds it to every token's loss).
+  max_logging.log(f"LOSS-PARTS step={step + 1} ce={lm - z:.6f} moe_lb={lb:.6f} z={z:.6f} tokens={weights:.0f}")
+
+
 def required_rbf_log_lines(config, step, probe, suffix=""):
   """REQUIRED_RBF (and with log_moe_dropped_tokens, MOE-DROPPED) lines for one step's moe_required_rbf vector.
 
@@ -1229,6 +1306,7 @@ def training_loop_iteration(
             state, metrics = p_train_step_dropless(state, example_batch, *step_rng_args)
             _maybe_log_required_rbf(config, step, metrics, "dropless")
 
+  _maybe_log_loss_parts(config, step, metrics)
   step_time_delta = datetime.datetime.now() - last_step_completion
   last_step_completion = datetime.datetime.now()
 
@@ -1575,6 +1653,8 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
 
   start_step = get_first_step(model, state)  # this is the start_step for training
   train_utils.validate_completed_steps(start_step, config.steps)
+  if start_step == 0 and getattr(config, "olmo_seed_token_rows", None) and not config.enable_diloco:
+    seed_token_rows(state.model, config.olmo_seed_token_rows)
 
   jit_model_dropless = None
   jit_model_eval = None

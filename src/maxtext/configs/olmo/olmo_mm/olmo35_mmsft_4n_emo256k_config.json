@@ -1,0 +1,1735 @@
+{
+  "run_name": "olmo35-mmsft-4n-emo256k",
+  "model": {
+    "lm": {
+      "d_model": 1024,
+      "vocab_size": 100352,
+      "n_layers": 16,
+      "block": {
+        "sequence_mixer": {
+          "n_heads": 8,
+          "n_v_heads": 8,
+          "head_dim": 128,
+          "expand_v": 2.0,
+          "allow_neg_eigval": true,
+          "conv_size": 4,
+          "conv_bias": false,
+          "norm_eps": 1e-05,
+          "use_experimental_kernels": false,
+          "dtype": "float32",
+          "_CLASS_": "olmo_core.nn.attention.kda.KimiDeltaAttentionConfig",
+          "type": "kimi_delta_attention"
+        },
+        "layer_norm": {
+          "name": "rms",
+          "eps": 1e-06,
+          "bias": false,
+          "dtype": "float32",
+          "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+        },
+        "name": "moe_fused_v2",
+        "shared_experts": {
+          "d_model": 1024,
+          "hidden_size": 1024,
+          "num_experts": 1,
+          "bias": false,
+          "dtype": "float32",
+          "activation": "swiglu",
+          "_CLASS_": "olmo_core.nn.moe.v2.shared_experts.SharedExpertsConfig"
+        },
+        "routed_experts": {
+          "d_model": 512,
+          "hidden_size": 1024,
+          "num_experts": 512,
+          "bias": false,
+          "dtype": "float32",
+          "rowwise_fp8": {
+            "enabled": false,
+            "block_size": 32,
+            "scale_mode": "rceil",
+            "use_fast_accum": true,
+            "fp8_only_params": true,
+            "fused_autograd": true,
+            "fused_autograd_recompute_swiglu": false,
+            "_CLASS_": "olmo_core.nn.moe.v2.fp8.MoERowwiseFP8Config"
+          },
+          "activation": "swiglu",
+          "activation_alpha": 1.702,
+          "row_specialization": "static",
+          "match_eager_rounding": false,
+          "_CLASS_": "olmo_core.nn.moe.v2.routed_experts.RoutedExpertsConfig"
+        },
+        "routed_experts_router": {
+          "d_model": 1024,
+          "num_experts": 512,
+          "top_k": 16,
+          "bias": false,
+          "normalize_expert_weights": 1.0,
+          "uniform_expert_assignment": false,
+          "random_expert_assignment": false,
+          "gating_function": "softmax",
+          "dtype": "float32",
+          "record_routing_batch_size": false,
+          "lb_loss_weight": 0.01,
+          "lb_loss_count_source": "executed",
+          "lb_loss_granularity": "local_batch",
+          "z_loss_weight": 1e-05,
+          "restore_weight_scale": true,
+          "use_recompute_fp32_cast": false,
+          "score_correction_bias": false,
+          "sigmoid_stability_epsilon": 1e-07,
+          "global_load_balancing": true,
+          "emo": {
+            "eos_token_id": 100257,
+            "min_document_expert_pool": 16,
+            "max_document_expert_pool": 512,
+            "eval_document_expert_pool": 512,
+            "causal_pool": true,
+            "_CLASS_": "olmo_core.nn.moe.emo.EmoRouterConfig"
+          },
+          "_CLASS_": "olmo_core.nn.moe.v2.router.MoERouterConfigV2"
+        },
+        "latent_moe": {
+          "latent_dim": 512,
+          "bias": false,
+          "up_proj_input_norm_enabled": false,
+          "_CLASS_": "olmo_core.nn.moe.moe.LatentMoEConfig"
+        },
+        "use_peri_norm": true,
+        "use_pre_norm": false,
+        "checkpoint_attn": false,
+        "checkpoint_permute_moe_unpermute": false,
+        "checkpoint_second_unpermute": false,
+        "ep": {
+          "path": "rowwise_nvshmem",
+          "schedule": "normal",
+          "capacity_factor": 1.25,
+          "shared_slots": 1,
+          "major_align": 1,
+          "rowwise_get_nblocks": 256,
+          "rowwise_put_nblocks": 256,
+          "rowwise_weighted_put_nblocks": 128,
+          "share_dispatch_out": true,
+          "share_combine_out": true,
+          "restore_unpermute_backend": "te_fused",
+          "rowwise_wave_num_waves": 1,
+          "rowwise_wave_mode": "expert",
+          "rowwise_wave_recompute_linear1": false,
+          "rowwise_wave_recompute_act": false,
+          "checkpoint_tbo": false,
+          "deepep": {
+            "num_sms": 0,
+            "num_qps": 0,
+            "num_allocated_qps": 0,
+            "expert_alignment": 1,
+            "async_mode": false,
+            "prefer_overlap_with_compute": true,
+            "allow_hybrid_mode": true,
+            "allow_multiple_reduction": true,
+            "weighting": "swiglu",
+            "_CLASS_": "olmo_core.nn.moe.v2.ep_config.DeepEPConfig"
+          },
+          "_CLASS_": "olmo_core.nn.moe.v2.ep_config.ExpertParallelConfig"
+        },
+        "rowwise_fp8": {
+          "enabled": false,
+          "block_size": 32,
+          "scale_mode": "rceil",
+          "use_fast_accum": true,
+          "fp8_only_params": true,
+          "fused_autograd": true,
+          "fused_autograd_recompute_swiglu": false,
+          "_CLASS_": "olmo_core.nn.moe.v2.fp8.MoERowwiseFP8Config"
+        },
+        "_CLASS_": "olmo_core.nn.ddp.block.OLMoDDPTransformerBlockConfig"
+      },
+      "lm_head": {
+        "name": "default",
+        "layer_norm": {
+          "name": "rms",
+          "eps": 1e-06,
+          "bias": false,
+          "dtype": "float32",
+          "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+        },
+        "bias": false,
+        "dtype": "float32",
+        "loss_implementation": "default",
+        "fp32_output": false,
+        "_CLASS_": "olmo_core.nn.lm_head.LMHeadConfig"
+      },
+      "embedding_norm": {
+        "name": "rms",
+        "eps": 1e-06,
+        "bias": false,
+        "dtype": "float32",
+        "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+      },
+      "name": "moe_fused_v2",
+      "dtype": "float32",
+      "init_method": "normal",
+      "init_seed": 12536,
+      "init_std": 0.02,
+      "block_overrides": {
+        "0": {
+          "sequence_mixer": {
+            "n_heads": 8,
+            "n_v_heads": 8,
+            "head_dim": 128,
+            "expand_v": 2.0,
+            "allow_neg_eigval": true,
+            "conv_size": 4,
+            "conv_bias": false,
+            "norm_eps": 1e-05,
+            "use_experimental_kernels": false,
+            "dtype": "float32",
+            "_CLASS_": "olmo_core.nn.attention.kda.KimiDeltaAttentionConfig",
+            "type": "kimi_delta_attention"
+          },
+          "layer_norm": {
+            "name": "rms",
+            "eps": 1e-06,
+            "bias": false,
+            "dtype": "float32",
+            "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+          },
+          "name": "moe_fused_v2",
+          "shared_experts": {
+            "d_model": 1024,
+            "hidden_size": 8192,
+            "num_experts": 1,
+            "bias": false,
+            "dtype": "float32",
+            "activation": "swiglu",
+            "_CLASS_": "olmo_core.nn.moe.v2.shared_experts.SharedExpertsConfig"
+          },
+          "use_peri_norm": true,
+          "use_pre_norm": false,
+          "checkpoint_attn": false,
+          "checkpoint_permute_moe_unpermute": false,
+          "checkpoint_second_unpermute": false,
+          "_CLASS_": "olmo_core.nn.ddp.block.OLMoDDPTransformerBlockConfig"
+        },
+        "7": {
+          "sequence_mixer": {
+            "name": "default",
+            "n_heads": 8,
+            "n_kv_heads": 4,
+            "head_dim": 128,
+            "bias": false,
+            "gate": {
+              "granularity": "elementwise",
+              "full_precision": true,
+              "_CLASS_": "olmo_core.nn.attention.GateConfig"
+            },
+            "qk_norm": {
+              "name": "rms",
+              "eps": 1e-06,
+              "bias": false,
+              "dtype": "float32",
+              "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+            },
+            "backend": "flash_4",
+            "dtype": "float32",
+            "use_head_qk_norm": true,
+            "scalable_softmax": true,
+            "qk_norm_per_head_gains": true,
+            "attention_sinks": false,
+            "_CLASS_": "olmo_core.nn.attention.AttentionConfig",
+            "type": "attention"
+          },
+          "layer_norm": {
+            "name": "rms",
+            "eps": 1e-06,
+            "bias": false,
+            "dtype": "float32",
+            "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+          },
+          "name": "moe_fused_v2",
+          "shared_experts": {
+            "d_model": 1024,
+            "hidden_size": 1024,
+            "num_experts": 1,
+            "bias": false,
+            "dtype": "float32",
+            "activation": "swiglu",
+            "_CLASS_": "olmo_core.nn.moe.v2.shared_experts.SharedExpertsConfig"
+          },
+          "routed_experts": {
+            "d_model": 512,
+            "hidden_size": 1024,
+            "num_experts": 512,
+            "bias": false,
+            "dtype": "float32",
+            "rowwise_fp8": {
+              "enabled": false,
+              "block_size": 32,
+              "scale_mode": "rceil",
+              "use_fast_accum": true,
+              "fp8_only_params": true,
+              "fused_autograd": true,
+              "fused_autograd_recompute_swiglu": false,
+              "_CLASS_": "olmo_core.nn.moe.v2.fp8.MoERowwiseFP8Config"
+            },
+            "activation": "swiglu",
+            "activation_alpha": 1.702,
+            "row_specialization": "static",
+            "match_eager_rounding": false,
+            "_CLASS_": "olmo_core.nn.moe.v2.routed_experts.RoutedExpertsConfig"
+          },
+          "routed_experts_router": {
+            "d_model": 1024,
+            "num_experts": 512,
+            "top_k": 16,
+            "bias": false,
+            "normalize_expert_weights": 1.0,
+            "uniform_expert_assignment": false,
+            "random_expert_assignment": false,
+            "gating_function": "softmax",
+            "dtype": "float32",
+            "record_routing_batch_size": false,
+            "lb_loss_weight": 0.01,
+            "lb_loss_count_source": "executed",
+            "lb_loss_granularity": "local_batch",
+            "z_loss_weight": 1e-05,
+            "restore_weight_scale": true,
+            "use_recompute_fp32_cast": false,
+            "score_correction_bias": false,
+            "sigmoid_stability_epsilon": 1e-07,
+            "global_load_balancing": true,
+            "emo": {
+              "eos_token_id": 100257,
+              "min_document_expert_pool": 16,
+              "max_document_expert_pool": 512,
+              "eval_document_expert_pool": 512,
+              "causal_pool": true,
+              "_CLASS_": "olmo_core.nn.moe.emo.EmoRouterConfig"
+            },
+            "_CLASS_": "olmo_core.nn.moe.v2.router.MoERouterConfigV2"
+          },
+          "latent_moe": {
+            "latent_dim": 512,
+            "bias": false,
+            "up_proj_input_norm_enabled": false,
+            "_CLASS_": "olmo_core.nn.moe.moe.LatentMoEConfig"
+          },
+          "use_peri_norm": true,
+          "use_pre_norm": false,
+          "checkpoint_attn": false,
+          "checkpoint_permute_moe_unpermute": false,
+          "checkpoint_second_unpermute": false,
+          "ep": {
+            "path": "rowwise_nvshmem",
+            "schedule": "normal",
+            "capacity_factor": 1.25,
+            "shared_slots": 1,
+            "major_align": 1,
+            "rowwise_get_nblocks": 256,
+            "rowwise_put_nblocks": 256,
+            "rowwise_weighted_put_nblocks": 128,
+            "share_dispatch_out": true,
+            "share_combine_out": true,
+            "restore_unpermute_backend": "te_fused",
+            "rowwise_wave_num_waves": 1,
+            "rowwise_wave_mode": "expert",
+            "rowwise_wave_recompute_linear1": false,
+            "rowwise_wave_recompute_act": false,
+            "checkpoint_tbo": false,
+            "deepep": {
+              "num_sms": 0,
+              "num_qps": 0,
+              "num_allocated_qps": 0,
+              "expert_alignment": 1,
+              "async_mode": false,
+              "prefer_overlap_with_compute": true,
+              "allow_hybrid_mode": true,
+              "allow_multiple_reduction": true,
+              "weighting": "swiglu",
+              "_CLASS_": "olmo_core.nn.moe.v2.ep_config.DeepEPConfig"
+            },
+            "_CLASS_": "olmo_core.nn.moe.v2.ep_config.ExpertParallelConfig"
+          },
+          "rowwise_fp8": {
+            "enabled": false,
+            "block_size": 32,
+            "scale_mode": "rceil",
+            "use_fast_accum": true,
+            "fp8_only_params": true,
+            "fused_autograd": true,
+            "fused_autograd_recompute_swiglu": false,
+            "_CLASS_": "olmo_core.nn.moe.v2.fp8.MoERowwiseFP8Config"
+          },
+          "_CLASS_": "olmo_core.nn.ddp.block.OLMoDDPTransformerBlockConfig"
+        },
+        "15": {
+          "sequence_mixer": {
+            "name": "default",
+            "n_heads": 8,
+            "n_kv_heads": 4,
+            "head_dim": 128,
+            "bias": false,
+            "gate": {
+              "granularity": "elementwise",
+              "full_precision": true,
+              "_CLASS_": "olmo_core.nn.attention.GateConfig"
+            },
+            "qk_norm": {
+              "name": "rms",
+              "eps": 1e-06,
+              "bias": false,
+              "dtype": "float32",
+              "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+            },
+            "backend": "flash_4",
+            "dtype": "float32",
+            "use_head_qk_norm": true,
+            "scalable_softmax": true,
+            "qk_norm_per_head_gains": true,
+            "attention_sinks": false,
+            "_CLASS_": "olmo_core.nn.attention.AttentionConfig",
+            "type": "attention"
+          },
+          "layer_norm": {
+            "name": "rms",
+            "eps": 1e-06,
+            "bias": false,
+            "dtype": "float32",
+            "_CLASS_": "olmo_core.nn.layer_norm.LayerNormConfig"
+          },
+          "name": "moe_fused_v2",
+          "shared_experts": {
+            "d_model": 1024,
+            "hidden_size": 1024,
+            "num_experts": 1,
+            "bias": false,
+            "dtype": "float32",
+            "activation": "swiglu",
+            "_CLASS_": "olmo_core.nn.moe.v2.shared_experts.SharedExpertsConfig"
+          },
+          "routed_experts": {
+            "d_model": 512,
+            "hidden_size": 1024,
+            "num_experts": 512,
+            "bias": false,
+            "dtype": "float32",
+            "rowwise_fp8": {
+              "enabled": false,
+              "block_size": 32,
+              "scale_mode": "rceil",
+              "use_fast_accum": true,
+              "fp8_only_params": true,
+              "fused_autograd": true,
+              "fused_autograd_recompute_swiglu": false,
+              "_CLASS_": "olmo_core.nn.moe.v2.fp8.MoERowwiseFP8Config"
+            },
+            "activation": "swiglu",
+            "activation_alpha": 1.702,
+            "row_specialization": "static",
+            "match_eager_rounding": false,
+            "_CLASS_": "olmo_core.nn.moe.v2.routed_experts.RoutedExpertsConfig"
+          },
+          "routed_experts_router": {
+            "d_model": 1024,
+            "num_experts": 512,
+            "top_k": 16,
+            "bias": false,
+            "normalize_expert_weights": 1.0,
+            "uniform_expert_assignment": false,
+            "random_expert_assignment": false,
+            "gating_function": "softmax",
+            "dtype": "float32",
+            "record_routing_batch_size": false,
+            "lb_loss_weight": 0.01,
+            "lb_loss_count_source": "executed",
+            "lb_loss_granularity": "local_batch",
+            "z_loss_weight": 1e-05,
+            "restore_weight_scale": true,
+            "use_recompute_fp32_cast": false,
+            "score_correction_bias": false,
+            "sigmoid_stability_epsilon": 1e-07,
+            "global_load_balancing": true,
+            "emo": {
+              "eos_token_id": 100257,
+              "min_document_expert_pool": 16,
+              "max_document_expert_pool": 512,
+              "eval_document_expert_pool": 512,
+              "causal_pool": true,
+              "_CLASS_": "olmo_core.nn.moe.emo.EmoRouterConfig"
+            },
+            "_CLASS_": "olmo_core.nn.moe.v2.router.MoERouterConfigV2"
+          },
+          "latent_moe": {
+            "latent_dim": 512,
+            "bias": false,
+            "up_proj_input_norm_enabled": false,
+            "_CLASS_": "olmo_core.nn.moe.moe.LatentMoEConfig"
+          },
+          "use_peri_norm": true,
+          "use_pre_norm": false,
+          "checkpoint_attn": false,
+          "checkpoint_permute_moe_unpermute": false,
+          "checkpoint_second_unpermute": false,
+          "ep": {
+            "path": "rowwise_nvshmem",
+            "schedule": "normal",
+            "capacity_factor": 1.25,
+            "shared_slots": 1,
+            "major_align": 1,
+            "rowwise_get_nblocks": 256,
+            "rowwise_put_nblocks": 256,
+            "rowwise_weighted_put_nblocks": 128,
+            "share_dispatch_out": true,
+            "share_combine_out": true,
+            "restore_unpermute_backend": "te_fused",
+            "rowwise_wave_num_waves": 1,
+            "rowwise_wave_mode": "expert",
+            "rowwise_wave_recompute_linear1": false,
+            "rowwise_wave_recompute_act": false,
+            "checkpoint_tbo": false,
+            "deepep": {
+              "num_sms": 0,
+              "num_qps": 0,
+              "num_allocated_qps": 0,
+              "expert_alignment": 1,
+              "async_mode": false,
+              "prefer_overlap_with_compute": true,
+              "allow_hybrid_mode": true,
+              "allow_multiple_reduction": true,
+              "weighting": "swiglu",
+              "_CLASS_": "olmo_core.nn.moe.v2.ep_config.DeepEPConfig"
+            },
+            "_CLASS_": "olmo_core.nn.moe.v2.ep_config.ExpertParallelConfig"
+          },
+          "rowwise_fp8": {
+            "enabled": false,
+            "block_size": 32,
+            "scale_mode": "rceil",
+            "use_fast_accum": true,
+            "fp8_only_params": true,
+            "fused_autograd": true,
+            "fused_autograd_recompute_swiglu": false,
+            "_CLASS_": "olmo_core.nn.moe.v2.fp8.MoERowwiseFP8Config"
+          },
+          "_CLASS_": "olmo_core.nn.ddp.block.OLMoDDPTransformerBlockConfig"
+        }
+      },
+      "embed_scale": 32.0,
+      "tie_word_embeddings": false,
+      "n_extra_vocab": 0,
+      "two_batch_overlap": false,
+      "recompute_all_blocks_by_chunk": false,
+      "recompute_each_block": true,
+      "_CLASS_": "olmo_core.nn.transformer.config.OLMoDDPModelConfig"
+    },
+    "vision": {
+      "name": "siglip",
+      "image_default_input_size": [
+        378,
+        378
+      ],
+      "image_patch_size": 14,
+      "image_emb_dim": 1152,
+      "image_num_heads": 16,
+      "image_num_key_value_heads": 16,
+      "image_num_layers": 25,
+      "image_head_dim": 72,
+      "image_mlp_dim": 4304,
+      "image_mlp_activations": "gelu_pytorch_tanh",
+      "image_num_pos": 729,
+      "image_norm_eps": 1e-06,
+      "attention_dropout": 0.0,
+      "residual_dropout": 0.0,
+      "use_cls_token": false,
+      "patch_embedding_bias": true,
+      "use_pre_ln": false,
+      "block": {
+        "name": "standard",
+        "_CLASS_": "olmo_core.nn.vision.config.VisionBlockConfig"
+      },
+      "initializer_range": 0.02,
+      "dtype": "float32",
+      "_CLASS_": "olmo_core.nn.vision.config.VisionEncoderConfig"
+    },
+    "connector": {
+      "image_emb_dim": 1152,
+      "image_num_heads": 16,
+      "image_num_key_value_heads": 16,
+      "image_head_dim": 72,
+      "output_dim": 1024,
+      "num_input_layers": 2,
+      "pooling_type": "attention_meanq",
+      "pooling_attention_mask": true,
+      "projector_type": "mlp",
+      "mlp_hidden_size": 9728,
+      "initializer_range": 0.02,
+      "dtype": "float32",
+      "_CLASS_": "olmo_core.nn.vision.connector.VisionConnectorConfig"
+    },
+    "image_patch_token_id": 100280,
+    "vit_layers": [
+      24,
+      18
+    ],
+    "sync_vit_crops": true,
+    "loss_chunk_size": 4096,
+    "compile_loss": true,
+    "_CLASS_": "olmo_core.nn.vision.multimodal.MultimodalLMConfig"
+  },
+  "dataset": {
+    "tokenizer": {
+      "vocab_size": 100278,
+      "eos_token_id": 100257,
+      "pad_token_id": 100277,
+      "identifier": "allenai/dolma2-tokenizer-olmo35",
+      "_CLASS_": "olmo_core.data.tokenizer.TokenizerConfig"
+    },
+    "sources": {
+      "text_sft": {
+        "numpy_dir": "/weka/oe-training-default/ai2-llm/checkpoints/abhishekr/c12/a7/cache-neptune/numpy_sft/bf82a8fab8-6068a350-rowaligned",
+        "work_dir": "/weka/olmo-3p5-post-checkpoints/jasonr/olmo35-mm-sft/dataset-cache/olmo35-mmsft-4n-emo256k/text",
+        "sequence_length": 65536,
+        "extra_numpy_dirs": [
+          "/weka/olmo-3p5-post-checkpoints/abhishekr/h182/replay-b1c12r"
+        ],
+        "tokenizer": {
+          "vocab_size": 100278,
+          "eos_token_id": 100257,
+          "pad_token_id": 100277,
+          "identifier": "allenai/dolma2-tokenizer-olmo35",
+          "_CLASS_": "olmo_core.data.tokenizer.TokenizerConfig"
+        },
+        "document_masking": true,
+        "max_document_segments": 8000,
+        "_CLASS_": "olmo_core.data.multimodal.sft_numpy_cache.SftNumpyCacheConfig"
+      },
+      "pixmo_ask_model_anything": {
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_ama.PixMoAmaDatasetConfig"
+      },
+      "pixmo_cap": {
+        "dataset_path": "/weka/oe-training-default/mm-olmo/torch_datasets/pixmo_datasets/cap",
+        "split": "train",
+        "require_split": false,
+        "mode": "sft_demo",
+        "require_transcript": false,
+        "max_crops": 8,
+        "max_sequence_length": 65536,
+        "loss_token_weighting": "root_subsegments",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "style_tag": true,
+        "style_length_conditioning": false,
+        "seed": 0,
+        "synthetic_size": 64,
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_cap.PixMoCapDatasetConfig"
+      },
+      "pixmo_cap_qa_as_user_qa": {
+        "style": "user_qa",
+        "prefix_how_many": true,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_cap_qa.PixMoCapQaDatasetConfig"
+      },
+      "correction_qa_multi_only_max5": {
+        "multi_image_only": true,
+        "max_images": 5,
+        "prefix_how_many": true,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CorrectionQaDatasetConfig"
+      },
+      "coco_2014_vqa_multi": {
+        "name": "coco_2014_vqa_multi",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "text_vqa": {
+        "name": "text_vqa",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "okvqa": {
+        "name": "okvqa",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "chart_qa_weighted": {
+        "name": "chart_qa_weighted",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "doc_qa": {
+        "name": "doc_qa",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "info_qa": {
+        "name": "info_qa",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "ai2_diagram_v2_mix_transparent": {
+        "name": "ai2_diagram_v2_mix_transparent",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "a_okvqa_mc": {
+        "name": "a_okvqa_mc",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "a_okvqa_da": {
+        "name": "a_okvqa_da",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "science_qa_img": {
+        "name": "science_qa_img",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "tabwmp_da": {
+        "name": "tabwmp_da",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "st_qa": {
+        "name": "st_qa",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "tally_qa": {
+        "name": "tally_qa",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "mantis_instruct_llava_665k_multi_multi_only": {
+        "subset": "llava_665k_multi",
+        "multi_image_only": true,
+        "max_crops": 8,
+        "max_images": 5,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.MantisInstructDatasetConfig"
+      },
+      "mantis_instruct_nlvr2_multi_only": {
+        "subset": "nlvr2",
+        "multi_image_only": true,
+        "max_crops": 8,
+        "max_images": 5,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.MantisInstructDatasetConfig"
+      },
+      "mantis_instruct_spot-the-diff_multi_only": {
+        "subset": "spot-the-diff",
+        "multi_image_only": true,
+        "max_crops": 8,
+        "max_images": 5,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.MantisInstructDatasetConfig"
+      },
+      "pixmo_clocks": {
+        "name": "pixmo_clocks",
+        "max_crops": 8,
+        "p_high_res": 0.0,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.academic_dataset.AcademicDatasetConfig"
+      },
+      "cosyn_multidoc_chart_exp": {
+        "doc_type": "chart",
+        "use_exp": true,
+        "max_images": 5,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CoSynMultiDocDatasetConfig"
+      },
+      "cosyn_multidoc_chemical_exp": {
+        "doc_type": "chemical",
+        "use_exp": true,
+        "max_images": 5,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CoSynMultiDocDatasetConfig"
+      },
+      "cosyn_multidoc_diagram_exp": {
+        "doc_type": "diagram",
+        "use_exp": true,
+        "max_images": 5,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CoSynMultiDocDatasetConfig"
+      },
+      "cosyn_multidoc_doc_exp": {
+        "doc_type": "doc",
+        "use_exp": true,
+        "max_images": 5,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CoSynMultiDocDatasetConfig"
+      },
+      "cosyn_multidoc_music_exp": {
+        "doc_type": "music",
+        "use_exp": true,
+        "max_images": 5,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CoSynMultiDocDatasetConfig"
+      },
+      "cosyn_multidoc_table_exp": {
+        "doc_type": "table",
+        "use_exp": true,
+        "max_images": 5,
+        "max_crops": 8,
+        "loss_token_weighting": "root_subsegments_root_tokens",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.CoSynMultiDocDatasetConfig"
+      },
+      "pixmo_multi_points": {
+        "styles": [
+          "multi_image_pointing",
+          "multi_image_point_then_count"
+        ],
+        "max_images": 5,
+        "max_crops": 8,
+        "p_high_res": 0.3,
+        "loss_token_weighting": "none",
+        "message_weight": 0.2,
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_format": "olmo35",
+        "seed": 0,
+        "_CLASS_": "olmo_core.data.multimodal.multi_image_datasets.PixMoMultiPointsDatasetConfig"
+      },
+      "pixmo_points_train": {
+        "split": "train",
+        "require_split": false,
+        "kind": "basic",
+        "counting": "both",
+        "both_mode": "per_annotation",
+        "annotation_sampling": "all",
+        "explicit_grounding_prompts": false,
+        "max_points": 60,
+        "max_total_points_per_example": 60,
+        "max_crops": 8,
+        "high_res_max_crops": 24,
+        "max_sequence_length": 65536,
+        "loss_token_weighting": "none",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_weight": 0.2,
+        "p_high_res": 0.3,
+        "message_format": "olmo35",
+        "seed": 0,
+        "prompt_templates": "uber_model_v2",
+        "system_prompt": "demo_or_style_v2",
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_points.PixMoPointsDatasetConfig"
+      },
+      "pixmo_count_train": {
+        "dataset_path": "/weka/oe-training-default/mm-olmo/torch_datasets/pixmo_datasets/count",
+        "split": "train",
+        "require_split": false,
+        "mode": "grounded",
+        "counting": "both",
+        "explicit_grounding_prompts": false,
+        "scalar_count_replay": false,
+        "max_crops": 8,
+        "high_res_max_crops": 24,
+        "max_sequence_length": 65536,
+        "loss_token_weighting": "none",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_weight": 0.2,
+        "p_high_res": 0.3,
+        "message_format": "olmo35",
+        "seed": 0,
+        "prompt_templates": "uber_model_v2",
+        "system_prompt": "demo_or_style_v2",
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_points.PixMoCountDatasetConfig"
+      },
+      "pixmo_points_high_freq_train": {
+        "split": "train",
+        "require_split": false,
+        "kind": "high_frequency",
+        "counting": "both",
+        "both_mode": "per_annotation",
+        "annotation_sampling": "all",
+        "explicit_grounding_prompts": false,
+        "max_points": 60,
+        "max_total_points_per_example": 60,
+        "max_crops": 8,
+        "high_res_max_crops": 24,
+        "max_sequence_length": 65536,
+        "loss_token_weighting": "none",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_weight": 0.2,
+        "p_high_res": 0.3,
+        "message_format": "olmo35",
+        "seed": 0,
+        "prompt_templates": "uber_model_v2",
+        "system_prompt": "demo_or_style_v2",
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_points.PixMoPointsDatasetConfig"
+      },
+      "cosyn_point": {
+        "dataset_path": "/weka/oe-training-default/mm-olmo/torch_datasets/pixmo_datasets/cosyn-point",
+        "split": "train",
+        "require_split": false,
+        "explicit_grounding_prompts": false,
+        "max_crops": 8,
+        "high_res_max_crops": 24,
+        "max_sequence_length": 65536,
+        "loss_token_weighting": "none",
+        "token_ids": {
+          "im_start_id": 100278,
+          "im_end_id": 100279,
+          "im_patch_id": 100280,
+          "im_col_id": 100281,
+          "low_res_im_start_id": 100282,
+          "image_placeholder_id": 100283,
+          "im_end_turn_id": 100265,
+          "_CLASS_": "olmo_core.nn.vision.molmo2_tokens.Molmo2TokenIds"
+        },
+        "message_weight": 0.2,
+        "p_high_res": 0.3,
+        "message_format": "olmo35",
+        "seed": 0,
+        "prompt_templates": "uber_model_v2",
+        "system_prompt": "demo_or_style_v2",
+        "annotation_sampling": "all",
+        "_CLASS_": "olmo_core.data.multimodal.pixmo_points.CoSynPointDatasetConfig"
+      }
+    },
+    "target_loss_mass": {
+      "text_sft": 0.9854058349659399,
+      "pixmo_ask_model_anything": 0.0020410520547125962,
+      "pixmo_cap": 0.0008590395289322561,
+      "pixmo_cap_qa_as_user_qa": 0.003006207320866744,
+      "correction_qa_multi_only_max5": 0.00161363777209085,
+      "coco_2014_vqa_multi": 5.8126843125328125e-05,
+      "text_vqa": 9.922618426279415e-06,
+      "okvqa": 4.385677613711727e-06,
+      "chart_qa_weighted": 6.261631630559073e-06,
+      "doc_qa": 1.5431558650681608e-05,
+      "info_qa": 8.665128323858444e-06,
+      "ai2_diagram_v2_mix_transparent": 7.866433179144323e-06,
+      "a_okvqa_mc": 7.540064906816691e-06,
+      "a_okvqa_da": 5.831301586883113e-06,
+      "science_qa_img": 6.919123500365481e-06,
+      "tabwmp_da": 6.613544422040069e-06,
+      "st_qa": 9.108808124399221e-06,
+      "tally_qa": 2.316432145580554e-05,
+      "mantis_instruct_llava_665k_multi_multi_only": 0.0007089214598112951,
+      "mantis_instruct_nlvr2_multi_only": 1.468211875049564e-05,
+      "mantis_instruct_spot-the-diff_multi_only": 1.8004966991432395e-05,
+      "pixmo_clocks": 2.611994212113364e-05,
+      "cosyn_multidoc_chart_exp": 0.0013161968412978558,
+      "cosyn_multidoc_chemical_exp": 0.00033172195601608795,
+      "cosyn_multidoc_diagram_exp": 0.0008825849854295911,
+      "cosyn_multidoc_doc_exp": 0.0012412960517426603,
+      "cosyn_multidoc_music_exp": 0.0004332272531011022,
+      "cosyn_multidoc_table_exp": 0.0009063281987210562,
+      "pixmo_multi_points": 0.00019161468431705989,
+      "pixmo_points_train": 0.0004529630595391237,
+      "pixmo_count_train": 3.2108533421993654e-05,
+      "pixmo_points_high_freq_train": 0.00025665346987697806,
+      "cosyn_point": 9.196778137389587e-05
+    },
+    "mean_loss_weight": {
+      "text_sft": 58020.47585551331,
+      "pixmo_ask_model_anything": 222.828125,
+      "pixmo_cap": 216.09375,
+      "pixmo_cap_qa_as_user_qa": 203.109375,
+      "correction_qa_multi_only_max5": 220.398438,
+      "coco_2014_vqa_multi": 17.25,
+      "text_vqa": 4.554688,
+      "okvqa": 3.945312,
+      "chart_qa_weighted": 3.178227,
+      "doc_qa": 6.632812,
+      "info_qa": 4.78125,
+      "ai2_diagram_v2_mix_transparent": 5.476562,
+      "a_okvqa_mc": 4.929688,
+      "a_okvqa_da": 3.8125,
+      "science_qa_img": 7.492188,
+      "tabwmp_da": 3.71875,
+      "st_qa": 4.914062,
+      "tally_qa": 5.53125,
+      "mantis_instruct_llava_665k_multi_multi_only": 153.570312,
+      "mantis_instruct_nlvr2_multi_only": 4.265625,
+      "mantis_instruct_spot-the-diff_multi_only": 17.757812,
+      "pixmo_clocks": 11.664062,
+      "cosyn_multidoc_chart_exp": 618.203125,
+      "cosyn_multidoc_chemical_exp": 580.101562,
+      "cosyn_multidoc_diagram_exp": 620.523438,
+      "cosyn_multidoc_doc_exp": 637.617188,
+      "cosyn_multidoc_music_exp": 537.007812,
+      "cosyn_multidoc_table_exp": 651.578125,
+      "pixmo_multi_points": 26.032816,
+      "pixmo_points_train": 68.435942,
+      "pixmo_count_train": 7.179687,
+      "pixmo_points_high_freq_train": 49.004694,
+      "cosyn_point": 21.420313
+    },
+    "model_vocab_size": 100352,
+    "tokenizer_revision": "8b9717061fae09d5be814373d189919a62a9a00d",
+    "tokenizer_cache_dir": "/weka/oe-training-default/ai2-llm/checkpoints/abhishekr/c11/hf_cache/hub",
+    "tokenizer_json_split": true,
+    "reserved_slot_tokens": [
+      "<think>",
+      "</think>"
+    ],
+    "_CLASS_": "olmo_core.data.multimodal.alignment.MultimodalMixtureConfig"
+  },
+  "data_loader": {
+    "global_batch_size": 2097152,
+    "sequence_length": 65536,
+    "work_dir": "/weka/olmo-3p5-post-checkpoints/jasonr/olmo35-mm-sft/dataset-cache/olmo35-mmsft-4n-emo256k/loader",
+    "seed": 34521,
+    "pack": true,
+    "pack_max_crops": 512,
+    "pack_buffer_size": 384,
+    "pack_image_weight": 1.0,
+    "continuous_stream": true,
+    "batch_metadata": true,
+    "image_dtype": "bfloat16",
+    "compact_images": true,
+    "est_tokens_per_example": 1400,
+    "prefetch_workers": 16,
+    "prefetch_max_in_flight": 512,
+    "prefetch_processes": true,
+    "defer_packed_image_copy": true,
+    "batch_prefetch_depth": 2,
+    "batch_prefetch_process": true,
+    "max_consecutive_data_errors": 10,
+    "max_total_data_errors": 1000,
+    "allow_legacy_state_without_dataset_fingerprints": false,
+    "_CLASS_": "olmo_core.data.multimodal.mixture_data_loader.MixtureDataLoaderConfig",
+    "type": "multimodal_mixture"
+  },
+  "train_module": {
+    "rank_microbatch_size": 65536,
+    "max_sequence_length": 65536,
+    "optim": {
+      "group_overrides": [
+        {
+          "params": [
+            "*connector.*"
+          ],
+          "opts": {
+            "lr": 0.0004,
+            "weight_decay": 0.0,
+            "scheduler_name": "connector"
+          },
+          "_CLASS_": "olmo_core.optim.config.OptimGroupOverride"
+        },
+        {
+          "params": [
+            "*vision.*"
+          ],
+          "opts": {
+            "lr": 2e-05,
+            "weight_decay": 0.0,
+            "scheduler_name": "vision"
+          },
+          "_CLASS_": "olmo_core.optim.config.OptimGroupOverride"
+        },
+        {
+          "params": [
+            "*lm.embeddings.weight"
+          ],
+          "opts": {},
+          "_CLASS_": "olmo_core.optim.config.OptimGroupOverride"
+        },
+        {
+          "params": [
+            "embeddings.weight"
+          ],
+          "opts": {
+            "weight_decay": 0.0
+          },
+          "_CLASS_": "olmo_core.optim.config.OptimGroupOverride"
+        },
+        {
+          "params": [
+            "*routed_experts.w_up_gate",
+            "*routed_experts.w_down"
+          ],
+          "opts": {},
+          "_CLASS_": "olmo_core.optim.config.OptimGroupOverride"
+        }
+      ],
+      "compile": true,
+      "fixed_fields": [
+        "initial_lr"
+      ],
+      "lr": 0.0002,
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "eps": 1e-08,
+      "weight_decay": 0.0,
+      "dtype": "float32",
+      "rolling_interval_length": 128,
+      "sigma_factor": 6,
+      "max_grad_norm": 1.0,
+      "use_distributed": true,
+      "reset_optimizer_moments_on_load": false,
+      "check_nan_inf_grad": true,
+      "clip_grad_norm_by_scheduler_group": true,
+      "foreach_chunk_size": 50000000,
+      "skip_nonfinite_grad_steps": false,
+      "_CLASS_": "olmo_core.optim.multimodal_optimizer.MultimodalOLMoDDPOptimizerConfig"
+    },
+    "max_grad_norm": 1.0,
+    "scheduler": {
+      "lr_field": "lr",
+      "initial_lr_field": "initial_lr",
+      "units": "steps",
+      "schedulers": {
+        "connector": {
+          "lr_field": "lr",
+          "initial_lr_field": "initial_lr",
+          "units": "steps",
+          "alpha_f": 0.0,
+          "t_max": 10962,
+          "warmup": 328,
+          "warmup_min_lr": 0.0,
+          "_CLASS_": "olmo_core.optim.scheduler.LinearWithWarmup",
+          "type": "linear_with_warmup"
+        },
+        "vision": {
+          "lr_field": "lr",
+          "initial_lr_field": "initial_lr",
+          "units": "steps",
+          "alpha_f": 0.0,
+          "t_max": 10962,
+          "warmup": 328,
+          "warmup_min_lr": 0.0,
+          "_CLASS_": "olmo_core.optim.scheduler.LinearWithWarmup",
+          "type": "linear_with_warmup"
+        }
+      },
+      "default": {
+        "lr_field": "lr",
+        "initial_lr_field": "initial_lr",
+        "units": "steps",
+        "alpha_f": 0.0,
+        "t_max": 10962,
+        "warmup": 328,
+        "warmup_min_lr": 0.0,
+        "_CLASS_": "olmo_core.optim.scheduler.LinearWithWarmup",
+        "type": "linear_with_warmup"
+      },
+      "group_name_field": "scheduler_name",
+      "_CLASS_": "olmo_core.optim.scheduler.PerGroupScheduler",
+      "type": "per_group"
+    },
+    "compile_model": false,
+    "dp_config": {
+      "name": "ddp",
+      "reduce_dtype": "float32",
+      "wrapping_strategy": "full",
+      "prefetch_factor": 0,
+      "only_allreduce_last_microbatch": true,
+      "reduce_grads_in_fp32": true,
+      "accumulate_grads_in_fp32": true,
+      "use_reduce_scatter": false,
+      "_CLASS_": "olmo_core.train.train_module.transformer.config.TransformerDataParallelConfig"
+    },
+    "z_loss_multiplier": 1e-05,
+    "reset_optimizer_states_on_load": true,
+    "reset_optimizer_states_on_resume": false,
+    "expand_shared_qk_norm_on_load": false,
+    "label_ignore_index": -100,
+    "freeze_params": [],
+    "vision_activation_checkpointing": true,
+    "connector_activation_checkpointing": false,
+    "compile_vision": false,
+    "response_logits_only": true,
+    "diagnostics_interval": 100,
+    "source_loss_mass_targets": {
+      "text_sft": 0.9854058349659399,
+      "pixmo_ask_model_anything": 0.0020410520547125962,
+      "pixmo_cap": 0.0008590395289322561,
+      "pixmo_cap_qa_as_user_qa": 0.003006207320866744,
+      "correction_qa_multi_only_max5": 0.00161363777209085,
+      "coco_2014_vqa_multi": 5.8126843125328125e-05,
+      "text_vqa": 9.922618426279415e-06,
+      "okvqa": 4.385677613711727e-06,
+      "chart_qa_weighted": 6.261631630559073e-06,
+      "doc_qa": 1.5431558650681608e-05,
+      "info_qa": 8.665128323858444e-06,
+      "ai2_diagram_v2_mix_transparent": 7.866433179144323e-06,
+      "a_okvqa_mc": 7.540064906816691e-06,
+      "a_okvqa_da": 5.831301586883113e-06,
+      "science_qa_img": 6.919123500365481e-06,
+      "tabwmp_da": 6.613544422040069e-06,
+      "st_qa": 9.108808124399221e-06,
+      "tally_qa": 2.316432145580554e-05,
+      "mantis_instruct_llava_665k_multi_multi_only": 0.0007089214598112951,
+      "mantis_instruct_nlvr2_multi_only": 1.468211875049564e-05,
+      "mantis_instruct_spot-the-diff_multi_only": 1.8004966991432395e-05,
+      "pixmo_clocks": 2.611994212113364e-05,
+      "cosyn_multidoc_chart_exp": 0.0013161968412978558,
+      "cosyn_multidoc_chemical_exp": 0.00033172195601608795,
+      "cosyn_multidoc_diagram_exp": 0.0008825849854295911,
+      "cosyn_multidoc_doc_exp": 0.0012412960517426603,
+      "cosyn_multidoc_music_exp": 0.0004332272531011022,
+      "cosyn_multidoc_table_exp": 0.0009063281987210562,
+      "pixmo_multi_points": 0.00019161468431705989,
+      "pixmo_points_train": 0.0004529630595391237,
+      "pixmo_count_train": 3.2108533421993654e-05,
+      "pixmo_points_high_freq_train": 0.00025665346987697806,
+      "cosyn_point": 9.196778137389587e-05
+    },
+    "trim_microbatch_image_padding": false,
+    "padding_input_token_id": 100257,
+    "balance_vit_crops": true,
+    "router_loss_divisor": "loss_tokens",
+    "_CLASS_": "olmo_core.train.train_module.transformer.multimodal_train_module.MultimodalOLMoDDPTrainModuleConfig"
+  },
+  "trainer": {
+    "save_folder": "/weka/olmo-3p5-post-checkpoints/jasonr/olmo35-mm-sft/checkpoints/olmo35-mmsft-4n-emo256k",
+    "work_dir": "/weka/olmo-3p5-post-checkpoints/jasonr/olmo35-mm-sft/dataset-cache/olmo35-mmsft-4n-emo256k",
+    "load_path": "/weka/olmo-3p5-mid-checkpoints/jasonr/olmo35-multimodal-midtraining/checkpoints/olmoe3-810m-cx2-mm-hero-mt-lc-256k-emocausal-lm1e4/step22240",
+    "load_strategy": "always",
+    "load_optim_state": false,
+    "load_trainer_state": false,
+    "checkpointer": {
+      "pre_download": false,
+      "load_thread_count": 8,
+      "throttle_uploads": false,
+      "_CLASS_": "olmo_core.train.checkpoint.CheckpointerConfig"
+    },
+    "save_overwrite": false,
+    "max_duration": {
+      "value": 10962,
+      "unit": "steps",
+      "_CLASS_": "olmo_core.train.common.Duration"
+    },
+    "cancel_check_interval": 10,
+    "metrics_collect_interval": 1,
+    "callbacks": {
+      "gpu_monitor": {
+        "_CLASS_": "olmo_core.train.callbacks.gpu_memory_monitor.GPUMemoryMonitorCallback"
+      },
+      "config_saver": {
+        "fname": "config.json",
+        "_CLASS_": "olmo_core.train.callbacks.config_saver.ConfigSaverCallback"
+      },
+      "garbage_collector": {
+        "gc_interval": 1000,
+        "enabled": true,
+        "_CLASS_": "olmo_core.train.callbacks.garbage_collector.GarbageCollectorCallback"
+      },
+      "checkpointer": {
+        "save_interval": 5481,
+        "ephemeral_save_interval": 250,
+        "save_async": false,
+        "remove": "ephemeral_only",
+        "max_checkpoints": 3,
+        "enabled": true,
+        "_CLASS_": "olmo_core.train.callbacks.multimodal.MultimodalCheckpointerCallback"
+      },
+      "metrics": {
+        "step_metrics_fname": "metrics_step{step}.json",
+        "final_metrics_fname": "metrics-final.json",
+        "save_interval": 1,
+        "enabled": true,
+        "_CLASS_": "olmo_core.train.callbacks.multimodal.MultimodalMetricSaverCallback"
+      },
+      "promoted_rows": {
+        "rows": [
+          [
+            100256,
+            [
+              14023,
+              771,
+              29
+            ]
+          ],
+          [
+            100266,
+            [
+              524,
+              27963,
+              29
+            ]
+          ]
+        ],
+        "_CLASS_": "olmo_core.train.callbacks.promoted_rows.PromotedTokenRowsCallback"
+      }
+    },
+    "bookkeeping_soft_timeout": 30,
+    "no_checkpoints": false,
+    "no_evals": false,
+    "_CLASS_": "olmo_core.train.config.TrainerConfig"
+  },
+  "init_seed": 6198,
+  "backend": "cpu:gloo,cuda:nccl",
+  "process_group_timeout_seconds": 900,
+  "recipe": {
+    "base": "256k-emo-causal",
+    "text_cache": "/weka/oe-training-default/ai2-llm/checkpoints/abhishekr/c12/a7/cache-neptune/numpy_sft/bf82a8fab8-6068a350-rowaligned",
+    "replay_dirs": [
+      "/weka/olmo-3p5-post-checkpoints/abhishekr/h182/replay-b1c12r"
+    ],
+    "text_instances": 294560,
+    "text_mean_loss_weight": 58020.47585551331,
+    "image_data": "stage2_v1",
+    "text_order": "mixture",
+    "data_seed": 34521,
+    "image_dose_tokens": 3500000000.0,
+    "high_res_sources": [],
+    "high_res_p": 1.0,
+    "high_res_mean_tokens": {},
+    "save_fraction": 0.5,
+    "image_pack_fill": 0.95,
+    "image_sources": {},
+    "calibration_samples": 32,
+    "lm_lr": 0.0002,
+    "warmup_ratio": 0.03,
+    "connector_lr_scale": 2.0,
+    "vision_lr_divisor": 10.0,
+    "max_grad_norm": 1.0,
+    "sequence_length": 65536,
+    "num_nodes": 4,
+    "gpus_per_node": 8,
+    "compile_model": false,
+    "save_interval": 5481,
+    "ephemeral_save_interval": 250,
+    "output_root": "/weka/olmo-3p5-post-checkpoints/jasonr/olmo35-mm-sft/checkpoints",
+    "work_dir": "/weka/olmo-3p5-post-checkpoints/jasonr/olmo35-mm-sft/dataset-cache",
+    "hf_cache_dir": "/weka/oe-training-default/ai2-llm/checkpoints/abhishekr/c11/hf_cache/hub",
+    "promoted_rows": true,
+    "step1_reference": false,
+    "prefetch_workers": 16,
+    "_CLASS_": "olmo_core.internal.olmo35_mm_sft.Olmo35MultimodalSFTRecipeConfig"
+  },
+  "schedule": {
+    "text_loss_share": 0.9854058349659399,
+    "target_loss_mass": {
+      "text_sft": 0.9854058349659399,
+      "pixmo_ask_model_anything": 0.0020410520547125962,
+      "pixmo_cap": 0.0008590395289322561,
+      "pixmo_cap_qa_as_user_qa": 0.003006207320866744,
+      "correction_qa_multi_only_max5": 0.00161363777209085,
+      "coco_2014_vqa_multi": 5.8126843125328125e-05,
+      "text_vqa": 9.922618426279415e-06,
+      "okvqa": 4.385677613711727e-06,
+      "chart_qa_weighted": 6.261631630559073e-06,
+      "doc_qa": 1.5431558650681608e-05,
+      "info_qa": 8.665128323858444e-06,
+      "ai2_diagram_v2_mix_transparent": 7.866433179144323e-06,
+      "a_okvqa_mc": 7.540064906816691e-06,
+      "a_okvqa_da": 5.831301586883113e-06,
+      "science_qa_img": 6.919123500365481e-06,
+      "tabwmp_da": 6.613544422040069e-06,
+      "st_qa": 9.108808124399221e-06,
+      "tally_qa": 2.316432145580554e-05,
+      "mantis_instruct_llava_665k_multi_multi_only": 0.0007089214598112951,
+      "mantis_instruct_nlvr2_multi_only": 1.468211875049564e-05,
+      "mantis_instruct_spot-the-diff_multi_only": 1.8004966991432395e-05,
+      "pixmo_clocks": 2.611994212113364e-05,
+      "cosyn_multidoc_chart_exp": 0.0013161968412978558,
+      "cosyn_multidoc_chemical_exp": 0.00033172195601608795,
+      "cosyn_multidoc_diagram_exp": 0.0008825849854295911,
+      "cosyn_multidoc_doc_exp": 0.0012412960517426603,
+      "cosyn_multidoc_music_exp": 0.0004332272531011022,
+      "cosyn_multidoc_table_exp": 0.0009063281987210562,
+      "pixmo_multi_points": 0.00019161468431705989,
+      "pixmo_points_train": 0.0004529630595391237,
+      "pixmo_count_train": 3.2108533421993654e-05,
+      "pixmo_points_high_freq_train": 0.00025665346987697806,
+      "cosyn_point": 9.196778137389587e-05
+    },
+    "text_instances": 294560,
+    "text_loss_mass": 17090511368.0,
+    "image_examples": 1887449.1183116394,
+    "image_sequences": 56216.59128289474,
+    "image_loss_mass": 253115756.54480568,
+    "image_tokens_per_example": 1854.3546239438863,
+    "image_loss_per_example": 134.10467815483298,
+    "steps": 10962,
+    "save_interval": 5481
+  },
+  "_CLASS_": "olmo_core.internal.olmo35_mm_sft.Olmo35MultimodalSFTExperimentConfig"
+}

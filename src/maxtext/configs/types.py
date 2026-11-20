@@ -4295,6 +4295,38 @@ class VisionTower(BaseModel):
           "independently to gradient_clipping_threshold."
       ),
   )
+  olmo_clip_embeddings_with_lm: bool = Field(
+      False,
+      description=(
+          "With olmo_per_component_grad_clip and no olmo_trainable_embedding_row_range: clip token_embedder with the"
+          " decoder (one group) instead of on its own. OLMo-core clips per scheduler group, and the multimodal SFT"
+          " recipe (olmo35_mm_sft) drops mid-training's separate embedding scheduler, so its groups are connector,"
+          " vision and everything else."
+      ),
+  )
+  olmo_router_loss_divisor: Literal["valid_tokens", "loss_tokens"] = Field(
+      "valid_tokens",
+      description=(
+          "OLMo-core router_loss_divisor: the router auxiliary losses (load balancing + router z-loss) are per-token"
+          " sums divided by the valid (non-padding) tokens, or with 'loss_tokens' by the loss weight sum (the CE"
+          " denominator), as the SFT trainers do."
+      ),
+  )
+  olmo_seed_token_rows: list[list[int]] = Field(
+      default_factory=list,
+      description=(
+          "Fresh runs only (start step 0): before the first step set each [target, source, source, ...] row of the"
+          " input embedding and the untied LM head to the mean of its source rows (OLMo-core PromotedTokenRowsCallback;"
+          " <think>/</think> of the Olmo 3.5 SFT: [[100256, 14023, 771, 29], [100266, 524, 27963, 29]])."
+      ),
+  )
+  log_loss_parts: bool = Field(
+      False,
+      description=(
+          "pre_train trainer: log a LOSS-PARTS line per step on host 0 (CE without z-loss, MoE aux loss, z-loss, loss"
+          " weight sum), as the SFT trainer does. step is 1-based (the step the line's update makes)."
+      ),
+  )
   olmo_trainable_embedding_row_range: list[int] = Field(
       default_factory=list,
       description=(
