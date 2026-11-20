@@ -1243,6 +1243,10 @@ def build_olmo_core_mixture_dataset(
     path_remap_to: str = "",
 ) -> Any:
   """Build the ``MultimodalDatasetMixture`` of a serialized ``OLMo-core`` experiment config once (all ranks share it)."""
+  # The image sources decode with these; without them OLMo-core's loader skips every image example as a data error
+  # (up to max_total_data_errors) and the run silently trains on text only.
+  import PIL  # pylint: disable=import-outside-toplevel,unused-import
+  import torchvision  # pylint: disable=import-outside-toplevel,unused-import
   if path_remap_from and path_remap_to:
     install_path_remap_prefix(path_remap_from, path_remap_to)
   register_merged_mt_lc_shim()

@@ -31,7 +31,7 @@
 #   steps = int(3% of 10,962), then linear to 0 at step 10,962, counted from 1 as OLMo-core), nothing frozen,
 #   gradient clipping 1.0 per OLMo-core scheduler group (connector / vision / everything else incl. embeddings),
 #   OLMo-core skip-step (128 steps, 6 sigma), fresh optimizer state.
-# Init: the converted B2e checkpoint (load_parameters_path); <think>/</think> rows seeded at step 0 (fresh runs only).
+# Init: the converted B2e checkpoint (load_parameters_path), <think>/</think> rows already seeded by the conversion.
 #
 # Launch (every host):
 #   python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/olmo/olmo35_tiny_mm_sft_64k.yml \
@@ -135,7 +135,9 @@ olmo_clip_embeddings_with_lm: true
 skip_step_on_spikes: true
 skip_step_interval: 128
 skip_step_scaling_factor: 6.0
-olmo_seed_token_rows: [[100256, 14023, 771, 29], [100266, 524, 27963, 29]]
+# <think>/</think> rows are seeded at checkpoint conversion (authoritative). To seed in the trainer instead (fresh
+# runs only), pass olmo_seed_token_rows=[[100256,14023,771,29],[100266,524,27963,29]].
+olmo_seed_token_rows: []
 
 # -------------- Checkpointing & logging --------------
 enable_checkpointing: true
