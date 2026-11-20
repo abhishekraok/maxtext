@@ -40,6 +40,7 @@ from flax import linen as nn
 from flax import nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from maxtext.common.common_types import Config
@@ -393,7 +394,99 @@ class OLMo35VisionEncoder(nnx.Module):
       out = self._encode_flat_crops(crops, act_pspec=flat_pspec).reshape(b_dim, n_crops * p, -1)
     return out
 
-  def __call__(self, input_images: jax.Array, deterministic: bool = True) -> jax.Array:
+  def _encode_balanced(self, patches: jax.Array, pooled_patches_idx: jax.Array) -> jax.Array | None:
+    """Encodes ``[B, N_crops, P, D_in]`` spreading the crops over all devices and skipping unused crop chunks.
+
+    Every crop is encoded on its own (ViT attention is per crop), and the connector only reads crops
+    ``< n_used[b] = max(pooled_patches_idx[b]) // P + 1``. Crop ``c = j * M + q`` of row ``b`` (``M`` = devices on the
+    batch and context axes) goes to device ``(q + b * M // B) % M``, slot ``(b, j)``: each row's leading crops land on
+    all devices, so every device holds about ``sum(n_used) / M`` used crops. Each device moves its used slots to the
+    front and the scan over crop chunks encodes only the chunks below the largest per-device count (one
+    ``lax.cond`` predicate for all devices); the other chunks and unused crops get zero features, which the
+    connector never reads. Returns ``None`` if the layout does not apply (the caller falls back).
+    """
+    b_dim, n_crops, p, d_in = patches.shape
+    chunk = int(self.config.olmo_vit_crop_chunk_size)
+    batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
+    cp_axis = self.config.context_sharding
+    bt = tuple(batch_axes) if isinstance(batch_axes, (tuple, list)) else ((batch_axes,) if batch_axes else ())
+    dev_axes = tuple(dict.fromkeys((*bt, cp_axis)))
+    m = 1
+    for a in dev_axes:
+      m *= int(self.mesh.shape.get(a, 1))
+    if m <= 1 or chunk <= 0 or n_crops % m != 0:
+      return None
+    j_dim = n_crops // m
+    slots = b_dim * j_dim
+    if slots % chunk != 0:
+      return None
+    n_chunks = slots // chunk
+    shifts = [(b * m) // b_dim % m for b in range(b_dim)]
+    dev_spec = dev_axes if len(dev_axes) > 1 else dev_axes[0]
+    sm = self.config.shard_mode
+
+    # Crops each row's connector reads: a prefix [0, n_used[b]).
+    idx = pooled_patches_idx.astype(jnp.int32)
+    n_used = jnp.where(jnp.any(idx >= 0, axis=(1, 2)), jnp.max(idx, axis=(1, 2)) // p + 1, 0)
+    n_used = jnp.minimum(n_used, n_crops).astype(jnp.int32)  # [B]
+
+    # Static crop index held by (device d, row b, slot j): j * M + (d - shift_b) % M.
+    crop_of = np.zeros((m, b_dim, j_dim), dtype=np.int32)
+    for b in range(b_dim):
+      q = (np.arange(m) - shifts[b]) % m
+      crop_of[:, b, :] = np.arange(j_dim)[None, :] * m + q[:, None]
+    valid = (jnp.asarray(crop_of) < n_used[None, :, None]).reshape(m, slots)
+    valid = sharding.maybe_shard_with_pspec(valid, PartitionSpec(dev_spec, None), self.mesh, sm)
+    order = jnp.argsort(jnp.logical_not(valid).astype(jnp.int32), axis=1, stable=True).astype(jnp.int32)
+    inv_order = jnp.argsort(order, axis=1).astype(jnp.int32)
+    k_max = jnp.max(jnp.sum(valid.astype(jnp.int32), axis=1))
+
+    # [B, N] -> [B, J, M] -> per-row roll over M -> [M, B * J] on all devices.
+    x = patches.reshape(b_dim, j_dim, m, p, d_in)
+    x = jnp.stack([jnp.roll(x[b], shifts[b], axis=1) if shifts[b] else x[b] for b in range(b_dim)], axis=0)
+    y = jnp.transpose(x, (2, 0, 1, 3, 4)).reshape(m, slots, p, d_in)
+    y = sharding.maybe_shard_with_pspec(y, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    y = jnp.take_along_axis(y, order[:, :, None, None], axis=1)
+    y = sharding.maybe_shard_with_pspec(y, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    chunked = jnp.transpose(y.reshape(m, n_chunks, chunk, p, d_in), (1, 0, 2, 3, 4))
+
+    remat = bool(self.config.olmo_vit_remat_blocks)
+    graphdef, state = nnx.split(self)
+    act_pspec = PartitionSpec(dev_spec, None, None, None)
+
+    def _encode(st, crop_chunk):
+      mod = nnx.merge(graphdef, st)
+      crop_chunk = sharding.maybe_shard_with_pspec(crop_chunk, act_pspec, self.mesh, sm)
+      return mod._encode_flat_crops(crop_chunk, act_pspec=act_pspec)  # pylint: disable=protected-access
+
+    out_aval = jax.eval_shape(_encode, state, jax.ShapeDtypeStruct((m, chunk, p, d_in), patches.dtype))
+
+    def _skip(st, crop_chunk):
+      del st, crop_chunk
+      return sharding.maybe_shard_with_pspec(
+          jnp.zeros(out_aval.shape, out_aval.dtype), act_pspec, self.mesh, sm
+      )
+
+    def _scan_body(carry, xs):
+      crop_chunk, i = xs
+      return carry, jax.lax.cond(i * chunk < k_max, _encode, _skip, carry, crop_chunk)
+
+    scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if remat else _scan_body
+    _, out_chunks = jax.lax.scan(scan_fn, state, (chunked, jnp.arange(n_chunks, dtype=jnp.int32)))
+    f_dim = out_aval.shape[-1]
+    feats = jnp.transpose(out_chunks, (1, 0, 2, 3, 4)).reshape(m, slots, p, f_dim)
+    feats = sharding.maybe_shard_with_pspec(feats, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    feats = jnp.take_along_axis(feats, inv_order[:, :, None, None], axis=1)
+    feats = jnp.where(valid[:, :, None, None], feats, jnp.zeros((), feats.dtype))
+    feats = sharding.maybe_shard_with_pspec(feats, PartitionSpec(dev_spec, None, None, None), self.mesh, sm)
+    # Back to [B, N * P, F]: [M, B, J] -> [B, J, M] -> undo the per-row roll.
+    f = jnp.transpose(feats.reshape(m, b_dim, j_dim, p, f_dim), (1, 2, 0, 3, 4))
+    f = jnp.stack([jnp.roll(f[b], -shifts[b], axis=1) if shifts[b] else f[b] for b in range(b_dim)], axis=0)
+    return f.reshape(b_dim, n_crops * p, f_dim)
+
+  def __call__(
+      self, input_images: jax.Array, deterministic: bool = True, pooled_patches_idx: jax.Array | None = None
+  ) -> jax.Array:
     del deterministic
     if input_images.ndim == 5:
       patches = patchify_hwc_to_olmo_cfirst(input_images, self.patch_size)
@@ -415,7 +508,11 @@ class OLMo35VisionEncoder(nnx.Module):
       patches = sharding.maybe_shard_with_pspec(
           patches, PartitionSpec(batch_axes, cp_axis, None, None), self.mesh, self.config.shard_mode
       )
-      out = self._encode_crops_maybe_chunked(patches, cp_sharded=True)
+      out = None
+      if bool(getattr(self.config, "olmo_vit_balance_crops", False)) and pooled_patches_idx is not None:
+        out = self._encode_balanced(patches, pooled_patches_idx)
+      if out is None:
+        out = self._encode_crops_maybe_chunked(patches, cp_sharded=True)
       out = sharding.maybe_shard_with_pspec(
           out, PartitionSpec(batch_axes, cp_axis, None), self.mesh, self.config.shard_mode
       )

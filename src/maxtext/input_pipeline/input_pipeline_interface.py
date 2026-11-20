@@ -25,6 +25,7 @@ from maxtext.input_pipeline.hf_data_processing import make_hf_train_iterator
 from maxtext.input_pipeline.hf_data_processing import make_hf_eval_iterator
 from maxtext.input_pipeline.olmo_grain_data_processing import make_olmo_grain_train_iterator
 from maxtext.input_pipeline.olmo_grain_data_processing import make_olmo_grain_eval_iterator
+from maxtext.input_pipeline import multihost_dataloading
 from maxtext.input_pipeline.olmo_mm_data_processing import make_olmo_mm_train_iterator
 from maxtext.input_pipeline.olmo_mm_data_processing import make_olmo_mm_eval_iterator
 from maxtext.input_pipeline.synthetic_data_processing import SyntheticDataIterator
@@ -65,6 +66,10 @@ def create_process_specific_iterator(
     output_iterator = iterator_fn()
   else:
     output_iterator = PlaceHolderDataIterator(config, mesh, is_training=is_training)
+  prefetch = int(getattr(config, "olmo_mm_prefetch_batches", 0) or 0)
+  if is_training and prefetch > 0 and config.dataset_type == "olmo_mm":
+    # Every host (loading or placeholder) builds its next batch while the step runs: same batches, same order.
+    output_iterator = multihost_dataloading.BackgroundPrefetchIterator(output_iterator, depth=prefetch)
   return output_iterator
 
 

@@ -150,7 +150,7 @@ class VisionEncoder(nnx.Module):
         mod = nnx.merge(graphdef, st_in)
         enc = getattr(mod, mod.encoder_name)
         proj = getattr(mod, mod.projector_name)
-        feats = enc(imgs_in, deterministic=deterministic)
+        feats = enc(imgs_in, deterministic=deterministic, pooled_patches_idx=masks_in)
         return proj(feats, masks_in)
 
       return _remat_olmo_vision(state, input_images, input_masks), None
@@ -161,6 +161,8 @@ class VisionEncoder(nnx.Module):
       encoder_output = encoder(
           input_images, video_mask=input_masks, video_grid_thw=video_grid_thw, deterministic=deterministic
       )
+    elif self.vision_encoder_block == VisionEncoderBlockType.OLMO35:
+      encoder_output = encoder(input_images, deterministic=deterministic, pooled_patches_idx=input_masks)
     else:
       encoder_output = encoder(input_images, deterministic=deterministic)
     deep_feats = None

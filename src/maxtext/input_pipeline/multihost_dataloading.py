@@ -360,6 +360,47 @@ class MultiHostDataLoadIterator:
     return jtu.tree_map(lambda x: jnp.full_like(x, 0), self.last_local_data)
 
 
+class BackgroundPrefetchIterator:
+  """Produces the next batch of ``iterator`` on one background thread while the current step runs.
+
+  The wrapped iterator is still read strictly in order, one batch at a time, so the batches (and their order) are
+  exactly those of ``iterator``; only the host work (loading, numpy assembly and the host->device copies of
+  ``MultiHostDataLoadIterator``) moves off the training loop's critical path. ``depth`` batches are kept in flight.
+  """
+
+  def __init__(self, iterator, depth: int = 1):
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+    import collections  # pylint: disable=import-outside-toplevel
+
+    self.iterator = iterator
+    self._depth = max(1, int(depth))
+    self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="batch-prefetch")
+    self._pending = collections.deque()
+
+  def __iter__(self):
+    return self
+
+  def __next__(self):
+    while len(self._pending) < self._depth + 1:
+      self._pending.append(self._pool.submit(next, self.iterator))
+    return self._pending.popleft().result()
+
+  def reset(self):
+    for f in self._pending:
+      try:
+        f.result()
+      except Exception:  # pylint: disable=broad-except
+        pass
+    self._pending.clear()
+    if hasattr(self.iterator, "reset"):
+      self.iterator.reset()
+
+  def close(self):
+    self._pool.shutdown(wait=False, cancel_futures=True)
+    if hasattr(self.iterator, "close"):
+      self.iterator.close()
+
+
 def _colocated_cpu_devices(
     devices: Sequence[jax.Device],
 ) -> Sequence[jax.Device]:

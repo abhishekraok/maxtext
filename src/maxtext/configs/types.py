@@ -3128,6 +3128,13 @@ class OlmoGrainDataset(BaseModel):
       0,
       description="olmo_mm: number of PyTorch DataLoader workers for live OLMo-core MixtureDataLoader.",
   )
+  olmo_mm_prefetch_batches: NonNegativeInt = Field(
+      0,
+      description=(
+          "olmo_mm: if > 0, every host builds (and copies to its devices) this many train batches ahead on a "
+          "background thread while the current step runs. Same batches in the same order."
+      ),
+  )
 
 
 class DPO(BaseModel):
@@ -4234,6 +4241,14 @@ class VisionTower(BaseModel):
   olmo_vit_cp_shard_crops: bool = Field(
       True,
       description="Under Context Parallelism, encode N_crops // CP crops per CP rank and AllGather.",
+  )
+  olmo_vit_balance_crops: bool = Field(
+      False,
+      description=(
+          "OLMo 3.5 ViT under CP crop sharding: spread every row's crops over all devices of the batch and context "
+          "axes and encode only the crop chunks that hold crops the connector reads (crop < max(pooled_patches_idx) "
+          "// patches_per_crop + 1); the rest are skipped. Same per-crop math; needs olmo_vit_crop_chunk_size > 0."
+      ),
   )
   olmo_image_patch_token_id: int = Field(
       100280,
