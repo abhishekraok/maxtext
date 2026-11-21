@@ -69,6 +69,10 @@ def main(argv=None) -> None:
   _log(f"ranks {ranks} of {kwargs['shard_count']}, {kwargs['num_workers']} process workers a rank, out_dir {out_dir}, "
        f"{ahead} batches ahead")
 
+  # The training process that started us. When it dies we are reparented (to PID 1 or a subreaper); compare
+  # against the PID we started under rather than against 1: in the training container the launcher execs
+  # python, so the training process itself is PID 1 and "ppid == 1" was always true (2026-11-21).
+  parent_pid = os.getppid()
   loaders, firsts = [], []
   t_start = time.time()
   # The workers are forked from this process. Freeze the heap first so the children's garbage collector does not
@@ -91,8 +95,8 @@ def main(argv=None) -> None:
   t_window = time.time()
   while True:
     while _pending_files(out_dir) >= ahead:
-      if os.getppid() == 1:
-        _log("parent process gone; exiting")
+      if os.getppid() != parent_pid:
+        _log(f"parent process {parent_pid} gone; exiting")
         return
       time.sleep(0.05)
     tmp = os.path.join(out_dir, f".{BATCH_FILE.format(step=step)}.tmp")
