@@ -1553,10 +1553,11 @@ class _ProducerNpzHostLoader:
     import time  # pylint: disable=import-outside-toplevel
 
     self._time = time
-    env = dict(os.environ)
-    env["JAX_PLATFORMS"] = "cpu"
-    env.pop("OLMO_MM_PRODUCER", None)
-    self._dirs, self._procs = [], []
+    self._subprocess = subprocess
+    self._env = dict(os.environ)
+    self._env["JAX_PLATFORMS"] = "cpu"
+    self._env.pop("OLMO_MM_PRODUCER", None)
+    self._dirs, self._specs, self._procs = [], [], []
     for rank in spec["ranks"]:
       rank_dir = os.path.join(spec["out_dir"], f"rank_{int(rank)}")
       os.makedirs(rank_dir, exist_ok=True)
@@ -1568,11 +1569,14 @@ class _ProducerNpzHostLoader:
       with builtins.open(spec_path, "w", encoding="utf-8") as f:
         json.dump(rank_spec, f)
       self._dirs.append(rank_dir)
-      self._procs.append(
-          subprocess.Popen(  # pylint: disable=consider-using-with
-              [sys.executable, "-m", "maxtext.input_pipeline.olmo_mm_producer", "--spec", spec_path], env=env
-          )
-      )
+      self._specs.append(spec_path)
+    # OLMO_MM_PRODUCER_LAZY=1: start the producers at the first batch request, after the checkpoint load and the
+    # compile, instead of here. Their memory (about 70 GiB of workers and in-flight examples for four ranks, plus
+    # the page cache of what they read) then never overlaps the training process's start-up peak (about 200 GiB a
+    # host at 256K, 2026-11-21). Costs the producers' own start-up (about 13 minutes) at step 0.
+    self._lazy = os.environ.get("OLMO_MM_PRODUCER_LAZY", "0") == "1"
+    if not self._lazy:
+      self._start()
     self._step = int(spec.get("start_step", 0))
     self._per_host_batch = int(per_host_batch)
     self._max_crops = int(max_crops_per_seq)
@@ -1581,6 +1585,14 @@ class _ProducerNpzHostLoader:
     self._use_loss_weights = bool(use_loss_weights)
     self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     self._pending = None
+
+  def _start(self) -> None:
+    for spec_path in self._specs:
+      self._procs.append(
+          self._subprocess.Popen(  # pylint: disable=consider-using-with
+              [sys.executable, "-m", "maxtext.input_pipeline.olmo_mm_producer", "--spec", spec_path], env=self._env
+          )
+      )
 
   def _load_rank(self, i: int, step: int) -> dict[str, np.ndarray]:
     path = os.path.join(self._dirs[i], f"batch_{step:07d}.npz")
@@ -1615,6 +1627,8 @@ class _ProducerNpzHostLoader:
 
   def __next__(self) -> dict[str, np.ndarray]:
     if self._pending is None:
+      if not self._procs:
+        self._start()
       self._pending = self._pool.submit(self._load, self._step)
     batch = self._pending.result()
     self._step += 1
