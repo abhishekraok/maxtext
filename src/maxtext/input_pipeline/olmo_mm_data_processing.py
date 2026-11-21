@@ -1172,6 +1172,7 @@ def build_olmo_core_mixture_loader(
     pack_buffer_size: Optional[int] = None,
     num_workers: int = 0,
     batch_prefetch_depth: Optional[int] = None,
+    processes: bool = False,
     seed_offset: int = 0,
     dataset: Any = None,
 ) -> Tuple[Any, dict[str, Any]]:
@@ -1204,16 +1205,23 @@ def build_olmo_core_mixture_loader(
     dl_dict["pack_buffer_size"] = int(pack_buffer_size)
   if seed_offset:
     dl_dict["seed"] = int(dl_dict.get("seed", 0)) ^ int(seed_offset)
-  # Keep worker loading in-process or thread-based inside JAX host processes to avoid fork+JAX deadlocks.
-  dl_dict["prefetch_processes"] = False
-  dl_dict["batch_prefetch_process"] = False
+  # Inside a JAX host process the workers stay threads: a fork after the TPU runtime is up deadlocks. The producer
+  # process of _ProducerNpzHostLoader (olmo_mm_producer.py) has no JAX runtime and asks for processes: OLMo-core
+  # forks its batch producer from the caller and the example workers from that (start the ranks one at a time;
+  # filelock refuses a fork while another thread holds a lock).
+  use_processes = bool(processes) and int(num_workers) > 0
+  dl_dict["prefetch_processes"] = use_processes
+  dl_dict["batch_prefetch_process"] = use_processes
   seq_len_cfg = int(dl_dict.get("sequence_length") or 0)
   if int(num_workers) <= 0:
     dl_dict["prefetch_workers"] = 0
     dl_dict["batch_prefetch_depth"] = 0
   else:
     dl_dict["prefetch_workers"] = int(num_workers)
-    default_depth = 0 if seq_len_cfg >= 65536 else min(int(dl_dict.get("batch_prefetch_depth") or 1), 1)
+    if use_processes:
+      default_depth = 2  # the batch producer process needs a depth above 0
+    else:
+      default_depth = 0 if seq_len_cfg >= 65536 else min(int(dl_dict.get("batch_prefetch_depth") or 1), 1)
     dl_dict["batch_prefetch_depth"] = (
         max(0, int(batch_prefetch_depth)) if batch_prefetch_depth is not None else default_depth
     )
@@ -1427,6 +1435,8 @@ class _LiveMixtureHostLoader:
       row_slice: Optional[slice] = None,
       dataset: Any = None,
       batch_hash_steps: int = 0,
+      processes: bool = False,
+      batch_prefetch_depth: Optional[int] = None,
   ):
     # olmo_mm_batch_hash_steps: log OLMo-core batch hashes of this rank's batches 1..batch_hash_steps.
     self._rank = int(shard_index)
@@ -1444,6 +1454,8 @@ class _LiveMixtureHostLoader:
         path_remap_to=path_remap_to,
         global_batch_tokens=global_batch_tokens,
         num_workers=num_workers,
+        batch_prefetch_depth=batch_prefetch_depth,
+        processes=processes,
         seed_offset=seed_offset,
         dataset=dataset,
     )
@@ -1507,6 +1519,83 @@ class _LiveMixtureHostLoader:
           raise ValueError(f"OLMO_MM_LOADER_WORLD: {name} has {arr.shape[0]} rows, expected {rank_rows}.")
       out = {name: np.ascontiguousarray(arr[self._row_slice]) for name, arr in out.items()}
     return out
+
+
+class _ProducerNpzHostLoader:
+  """This host's batches from a producer process (olmo_mm_producer.py) that runs the live loader with process
+  workers and writes compact ``.npz`` files into a local directory; see that module for why. Started here with fork
+  and exec (``python -m``), so it has no TPU runtime. Each file is read once (the next one on a thread, so the read
+  overlaps the step) and deleted. ``OLMO_MM_PRODUCER=1`` selects this loader in _make_mm_loader_for_host."""
+
+  def __init__(
+      self,
+      *,
+      spec: dict[str, Any],
+      per_host_batch: int,
+      max_crops_per_seq: int,
+      max_pooled_patches_per_seq: int,
+      dtype_mm: Any,
+      use_loss_weights: bool,
+  ):
+    import concurrent.futures  # pylint: disable=import-outside-toplevel
+    import subprocess  # pylint: disable=import-outside-toplevel
+    import time  # pylint: disable=import-outside-toplevel
+
+    self._time = time
+    self._dir = spec["out_dir"]
+    os.makedirs(self._dir, exist_ok=True)
+    for name in os.listdir(self._dir):  # a previous attempt's files
+      if name.endswith(".npz") or name.endswith(".tmp"):
+        os.remove(os.path.join(self._dir, name))
+    spec_path = os.path.join(self._dir, "spec.json")
+    with builtins.open(spec_path, "w", encoding="utf-8") as f:
+      json.dump(spec, f)
+    env = dict(os.environ)
+    env["JAX_PLATFORMS"] = "cpu"
+    env.pop("OLMO_MM_PRODUCER", None)
+    self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        [sys.executable, "-m", "maxtext.input_pipeline.olmo_mm_producer", "--spec", spec_path], env=env
+    )
+    self._step = int(spec.get("start_step", 0))
+    self._per_host_batch = int(per_host_batch)
+    self._max_crops = int(max_crops_per_seq)
+    self._max_pooled = int(max_pooled_patches_per_seq)
+    self._dtype_mm = dtype_mm
+    self._use_loss_weights = bool(use_loss_weights)
+    self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    self._pending = None
+
+  def _load(self, step: int) -> dict[str, np.ndarray]:
+    path = os.path.join(self._dir, f"batch_{step:07d}.npz")
+    while not os.path.exists(path):
+      rc = self._proc.poll()
+      if rc is not None:
+        raise RuntimeError(f"olmo_mm producer process exited with code {rc} before batch {step} (see its log lines)")
+      self._time.sleep(0.05)
+    batch = load_maxtext_batch_npz(
+        path,
+        max_crops_per_seq=self._max_crops,
+        max_pooled_patches_per_seq=self._max_pooled,
+        dtype_mm=self._dtype_mm,
+        row_slice=None,
+        use_loss_weights=self._use_loss_weights,
+        include_router_token_mask=True,
+    )
+    os.remove(path)
+    if batch["inputs"].shape[0] != self._per_host_batch:
+      raise ValueError(f"producer batch {step} has {batch['inputs'].shape[0]} rows, expected {self._per_host_batch}")
+    return batch
+
+  def __iter__(self):
+    return self
+
+  def __next__(self) -> dict[str, np.ndarray]:
+    if self._pending is None:
+      self._pending = self._pool.submit(self._load, self._step)
+    batch = self._pending.result()
+    self._step += 1
+    self._pending = self._pool.submit(self._load, self._step)
+    return batch
 
 
 class _MultiRankHostLoader:
@@ -1743,6 +1832,56 @@ def _make_mm_loader_for_host(
       batch_hash_steps=batch_hash_steps,
     )
 
+  if os.environ.get("OLMO_MM_PRODUCER", "0") == "1":
+    # The live loader in a producer process with process workers (olmo_mm_producer.py); this process only reads
+    # its files. The training process does not build the loader, so the loading hosts reach the checkpoint load's
+    # barrier with the others.
+    ranks = [shard_index] if host_ranks is None else list(host_ranks)
+    base = os.environ.get("OLMO_MM_PRODUCER_DIR", "/dev/shm/olmo_mm_batches")
+    spec = {
+        "out_dir": os.path.join(base, "eval" if is_eval else "train"),
+        "ranks": ranks,
+        "ahead": int(os.environ.get("OLMO_MM_PRODUCER_AHEAD", "4")),
+        "start_step": resumed_step,
+        "live_kwargs": dict(
+            config_path=cfg_path,
+            work_dir=work_dir,
+            shard_count=shard_count,
+            per_host_batch=per_host_batch,
+            max_target_length=int(config.max_target_length),
+            max_crops_per_seq=n_crops,
+            max_pooled_patches_per_seq=n_pooled,
+            n_patches_per_crop=n_patches,
+            patch_dim=patch_dim,
+            pool_size=pool_size,
+            dtype_mm=str(jnp.dtype(config.dtype_mm)),
+            reset_positions_on_segment=bool(getattr(config, "olmo_reset_positions_on_segment", True)),
+            padding_input_token_id=int(getattr(config, "olmo_mm_padding_input_token_id", -1)),
+            use_loss_weights=use_loss_weights,
+            path_remap_from=getattr(config, "olmo_path_remap_from", "") or "",
+            path_remap_to=getattr(config, "olmo_path_remap_to", "") or "",
+            num_workers=int(os.environ.get("OLMO_MM_PRODUCER_WORKERS", "48")),
+            processes=True,
+            batch_prefetch_depth=int(os.environ.get("OLMO_MM_PRODUCER_DEPTH", "2")),
+            seed_offset=0x1F1F1F1F if is_eval else 0,
+            initial_batch_step=resumed_step,
+            row_slice=[row_slice.start, row_slice.stop] if row_slice is not None else None,
+            # MM-BATCH-HASH lines are written by the producer process (same stdout as the trainer's).
+            batch_hash_steps=batch_hash_steps,
+        ),
+    }
+    max_logging.log(
+        f"OLMo MM producer process: ranks {ranks} of {shard_count}, {spec['live_kwargs']['num_workers']} process "
+        f"workers a rank, {spec['ahead']} batches ahead in {spec['out_dir']}"
+    )
+    return _ProducerNpzHostLoader(
+        spec=spec,
+        per_host_batch=len(ranks) * per_host_batch,
+        max_crops_per_seq=n_crops,
+        max_pooled_patches_per_seq=n_pooled,
+        dtype_mm=config.dtype_mm,
+        use_loss_weights=use_loss_weights,
+    )
   if host_ranks is None:
     return build_live(shard_index)
   return _MultiRankHostLoader([build_live(rank) for rank in host_ranks])
