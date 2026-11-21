@@ -1522,10 +1522,12 @@ class _LiveMixtureHostLoader:
 
 
 class _ProducerNpzHostLoader:
-  """This host's batches from a producer process (olmo_mm_producer.py) that runs the live loader with process
-  workers and writes compact ``.npz`` files into a local directory; see that module for why. Started here with fork
-  and exec (``python -m``), so it has no TPU runtime. Each file is read once (the next one on a thread, so the read
-  overlaps the step) and deleted. ``OLMO_MM_PRODUCER=1`` selects this loader in _make_mm_loader_for_host."""
+  """This host's batches from producer processes (olmo_mm_producer.py), one per loader rank, that run the live
+  loader with process workers and write compact ``.npz`` files into a local directory; see that module for why.
+  Started here with fork and exec (``python -m``), so they have no TPU runtime. One producer per rank keeps each
+  forked worker's inherited heap to one rank's state (host memory: four ranks in one producer reached 370 GB
+  with 64 workers). Each step reads one file per rank (the next step's on a thread, so the reads overlap the
+  step), concatenates them in rank order and deletes them. ``OLMO_MM_PRODUCER=1`` selects this loader."""
 
   def __init__(
       self,
@@ -1542,20 +1544,26 @@ class _ProducerNpzHostLoader:
     import time  # pylint: disable=import-outside-toplevel
 
     self._time = time
-    self._dir = spec["out_dir"]
-    os.makedirs(self._dir, exist_ok=True)
-    for name in os.listdir(self._dir):  # a previous attempt's files
-      if name.endswith(".npz") or name.endswith(".tmp"):
-        os.remove(os.path.join(self._dir, name))
-    spec_path = os.path.join(self._dir, "spec.json")
-    with builtins.open(spec_path, "w", encoding="utf-8") as f:
-      json.dump(spec, f)
     env = dict(os.environ)
     env["JAX_PLATFORMS"] = "cpu"
     env.pop("OLMO_MM_PRODUCER", None)
-    self._proc = subprocess.Popen(  # pylint: disable=consider-using-with
-        [sys.executable, "-m", "maxtext.input_pipeline.olmo_mm_producer", "--spec", spec_path], env=env
-    )
+    self._dirs, self._procs = [], []
+    for rank in spec["ranks"]:
+      rank_dir = os.path.join(spec["out_dir"], f"rank_{int(rank)}")
+      os.makedirs(rank_dir, exist_ok=True)
+      for name in os.listdir(rank_dir):  # a previous attempt's files
+        if name.endswith(".npz") or name.endswith(".tmp"):
+          os.remove(os.path.join(rank_dir, name))
+      rank_spec = dict(spec, ranks=[int(rank)], out_dir=rank_dir)
+      spec_path = os.path.join(rank_dir, "spec.json")
+      with builtins.open(spec_path, "w", encoding="utf-8") as f:
+        json.dump(rank_spec, f)
+      self._dirs.append(rank_dir)
+      self._procs.append(
+          subprocess.Popen(  # pylint: disable=consider-using-with
+              [sys.executable, "-m", "maxtext.input_pipeline.olmo_mm_producer", "--spec", spec_path], env=env
+          )
+      )
     self._step = int(spec.get("start_step", 0))
     self._per_host_batch = int(per_host_batch)
     self._max_crops = int(max_crops_per_seq)
@@ -1565,12 +1573,12 @@ class _ProducerNpzHostLoader:
     self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     self._pending = None
 
-  def _load(self, step: int) -> dict[str, np.ndarray]:
-    path = os.path.join(self._dir, f"batch_{step:07d}.npz")
+  def _load_rank(self, i: int, step: int) -> dict[str, np.ndarray]:
+    path = os.path.join(self._dirs[i], f"batch_{step:07d}.npz")
     while not os.path.exists(path):
-      rc = self._proc.poll()
+      rc = self._procs[i].poll()
       if rc is not None:
-        raise RuntimeError(f"olmo_mm producer process exited with code {rc} before batch {step} (see its log lines)")
+        raise RuntimeError(f"olmo_mm producer for {self._dirs[i]} exited with code {rc} before batch {step} (see its log)")
       self._time.sleep(0.05)
     batch = load_maxtext_batch_npz(
         path,
@@ -1582,6 +1590,13 @@ class _ProducerNpzHostLoader:
         include_router_token_mask=True,
     )
     os.remove(path)
+    return batch
+
+  def _load(self, step: int) -> dict[str, np.ndarray]:
+    parts = [self._load_rank(i, step) for i in range(len(self._dirs))]
+    if any(set(p) != set(parts[0]) for p in parts):
+      raise ValueError("producer rank batches have different fields")
+    batch = {name: np.concatenate([p[name] for p in parts], axis=0) for name in parts[0]}
     if batch["inputs"].shape[0] != self._per_host_batch:
       raise ValueError(f"producer batch {step} has {batch['inputs'].shape[0]} rows, expected {self._per_host_batch}")
     return batch

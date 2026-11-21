@@ -10,6 +10,7 @@ Why: at 256K each loading host builds four sequences a step from raw sources (im
 rendering, tokenization), work that threads cannot spread over the host's cores (the GIL). One host took 33 to
 44 s a batch with 8 threads and about 2 s with 16 process workers a rank (2026-11-21).
 
+The loader runs one producer per rank (see _ProducerNpzHostLoader), so a child inherits one rank's state only.
 The ranks are started one at a time on this thread: each start forks OLMo-core's batch producer process, and
 ``filelock`` refuses a fork while another thread is inside a lock (the other ranks starting, in a thread pool).
 After that the ranks are read in parallel threads; no further forks happen in this process.
@@ -21,6 +22,7 @@ the keyword arguments of ``_LiveMixtureHostLoader`` without ``shard_index``.
 
 import argparse
 import concurrent.futures
+import gc
 import json
 import os
 import sys
@@ -69,6 +71,11 @@ def main(argv=None) -> None:
 
   loaders, firsts = [], []
   t_start = time.time()
+  # The workers are forked from this process. Freeze the heap first so the children's garbage collector does not
+  # touch the inherited objects' headers, which would make every shared page private in every child (CPython
+  # copy-on-write; 64 children of a parent holding four ranks' state reached 370 GB on one host, 2026-11-21).
+  gc.collect()
+  gc.freeze()
   for rank in ranks:
     t0 = time.time()
     loader = mm._LiveMixtureHostLoader(shard_index=rank, **kwargs)  # pylint: disable=protected-access
