@@ -1679,6 +1679,10 @@ olmo_vit_remat_blocks: true
 olmo_vit_crop_chunk_size: 0
 olmo_vit_cp_shard_crops: true
 olmo_vit_balance_crops: false # spread crops over all devices and skip chunks with no used crop
+olmo_vit_outer_remat: true # jax.checkpoint the whole OLMo 3.5 vision tower + connector (with olmo_vit_remat_blocks, CP)
+olmo_vit_chunk_remat: true # jax.checkpoint the ViT / connector chunk-scan bodies (with olmo_vit_remat_blocks)
+olmo_connector_gather_once: false # gather the connector's pooled features once (reduce-scatter grad) instead of per chunk
+olmo_connector_skip_empty_chunks: false # with olmo_connector_gather_once: skip chunks with no valid pooled patch
 olmo_image_patch_token_id: 100280
 olmo_connector_mlp_hidden_size: 9728
 olmo_connector_pool_size: 4

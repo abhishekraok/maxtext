@@ -4242,6 +4242,38 @@ class VisionTower(BaseModel):
       True,
       description="Under Context Parallelism, encode N_crops // CP crops per CP rank and AllGather.",
   )
+  olmo_vit_outer_remat: bool = Field(
+      True,
+      description=(
+          "With olmo_vit_remat_blocks under CP: wrap the whole OLMo 3.5 vision tower + connector in one more "
+          "jax.checkpoint (recomputed in the backward). False keeps its residuals (the crop-chunk scan inputs and "
+          "the connector's pooled inputs) and saves one ViT forward per step. Same math."
+      ),
+  )
+  olmo_vit_chunk_remat: bool = Field(
+      True,
+      description=(
+          "With olmo_vit_remat_blocks: jax.checkpoint the body of the ViT crop-chunk scan and of the connector "
+          "chunk scan. False keeps every chunk's per-block inputs (the blocks stay checkpointed) and saves one ViT "
+          "forward per step. Same math."
+      ),
+  )
+  olmo_connector_gather_once: bool = Field(
+      False,
+      description=(
+          "OLMo 3.5 connector under CP crop sharding: gather the pooled patch features once per micro-batch in a "
+          "shard_map (all-gather of the CP-sharded ViT features in, reduce-scatter of their gradient out) instead of "
+          "in every connector chunk (one full-size scatter-add + all-reduce of the features per chunk in the "
+          "backward). Same math."
+      ),
+  )
+  olmo_connector_skip_empty_chunks: bool = Field(
+      False,
+      description=(
+          "With olmo_connector_gather_once: skip (lax.cond, zeros) connector chunks with no valid pooled patch on "
+          "any device, as their output is zero anyway."
+      ),
+  )
   olmo_vit_balance_crops: bool = Field(
       False,
       description=(

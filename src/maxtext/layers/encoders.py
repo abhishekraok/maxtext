@@ -122,6 +122,7 @@ class VisionEncoder(nnx.Module):
     if (
         self.vision_encoder_block == VisionEncoderBlockType.OLMO35
         and bool(getattr(self.config, "olmo_vit_remat_blocks", True))
+        and bool(getattr(self.config, "olmo_vit_outer_remat", True))
         and not self.config.freeze_vision_encoder_params
         and cp_size > 1
     ):

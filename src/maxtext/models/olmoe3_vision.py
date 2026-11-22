@@ -408,7 +408,8 @@ class OLMo35VisionEncoder(nnx.Module):
           )
           return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec)  # pylint: disable=protected-access
 
-        scan_fn_cp = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body_cp) if remat else _scan_body_cp
+        chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
+        scan_fn_cp = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body_cp) if chunk_remat else _scan_body_cp
         _, out_chunks = jax.lax.scan(scan_fn_cp, state, chunked)
         out = jnp.transpose(out_chunks, (1, 2, 0, 3, 4, 5)).reshape(b_dim, n_crops * p, -1)
       else:
@@ -421,7 +422,8 @@ class OLMo35VisionEncoder(nnx.Module):
           mod = nnx.merge(graphdef, carry)
           return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec)  # pylint: disable=protected-access
 
-        scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if remat else _scan_body
+        chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
+        scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if chunk_remat else _scan_body
         _, out_chunks = jax.lax.scan(scan_fn, state, chunked)
         out = jnp.swapaxes(out_chunks, 0, 1).reshape(b_dim, n_crops * p, -1)
     else:
@@ -539,7 +541,8 @@ class OLMo35VisionEncoder(nnx.Module):
       crop_chunk, i = xs
       return carry, jax.lax.cond(i * chunk < k_max, _encode, _skip, carry, crop_chunk)
 
-    scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if remat else _scan_body
+    chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
+    scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if chunk_remat else _scan_body
     _, out_chunks = jax.lax.scan(scan_fn, state, (chunked, jnp.arange(n_chunks, dtype=jnp.int32)))
     f_dim = out_aval.shape[-1]
     feats = jnp.transpose(out_chunks, (1, 0, 2, 3, 4)).reshape(m, slots, p, f_dim)
@@ -582,6 +585,9 @@ class OLMo35VisionEncoder(nnx.Module):
       out = sharding.maybe_shard_with_pspec(
           out, PartitionSpec(batch_axes, cp_axis, None), self.mesh, self.config.shard_mode
       )
+      if bool(getattr(self.config, "olmo_connector_gather_once", False)):
+        # The connector all-gathers the features itself (and reduce-scatters their gradient).
+        return out
       return sharding.maybe_shard_with_pspec(
           out, PartitionSpec(batch_axes, None, None), self.mesh, self.config.shard_mode
       )
@@ -720,13 +726,22 @@ class OLMo35VisionConnector(nnx.Module):
   ) -> jax.Array:
     b, n_total, dim = image_features.shape
     n_pooled, pool_size = pooled_patches_idx.shape[1], pooled_patches_idx.shape[2]
-    valid = pooled_patches_idx >= 0
     safe_idx = jnp.clip(pooled_patches_idx, 0, max(n_total - 1, 0))
     # Gather strictly within axis 1 (n_total) per batch item so axis 0 (B) stays shard-local.
     gather_idx = safe_idx.reshape(b, n_pooled * pool_size, 1)
     if act_pspec is not None and self.mesh is not None:
       gather_idx = sharding.maybe_shard_with_pspec(gather_idx, act_pspec, self.mesh, self.config.shard_mode)
     to_pool = jnp.take_along_axis(image_features, gather_idx, axis=1).reshape(b, n_pooled, pool_size, dim)
+    return self._pool_and_project(to_pool, pooled_patches_idx, act_pspec=act_pspec)
+
+  def _pool_and_project(
+      self,
+      to_pool: jax.Array,
+      pooled_patches_idx: jax.Array,
+      act_pspec: PartitionSpec | None = None,
+  ) -> jax.Array:
+    """Pools the gathered ``to_pool`` ``[B, N_pooled, pool_size, dim]`` features and projects them to ``emb_dim``."""
+    valid = pooled_patches_idx >= 0
     if act_pspec is not None and self.mesh is not None:
       pool4_pspec = PartitionSpec(act_pspec[0], act_pspec[1], None, None)
       to_pool = sharding.maybe_shard_with_pspec(to_pool, pool4_pspec, self.mesh, self.config.shard_mode)
@@ -743,6 +758,98 @@ class OLMo35VisionConnector(nnx.Module):
     if act_pspec is not None and self.mesh is not None:
       out = sharding.maybe_shard_with_pspec(out, act_pspec, self.mesh, self.config.shard_mode)
     return out
+
+  def _forward_connector_gather_once(self, image_features: jax.Array, pooled_patches_idx: jax.Array) -> jax.Array:
+    """CP connector: one gather per micro-batch instead of one per chunk (``olmo_connector_gather_once``).
+
+    ``image_features`` ``[B, N_total, dim]`` arrive sharded on the context axis. A shard_map all-gathers them on the
+    context axis and gathers each rank's pooled patches (``[B, N_pooled / CP, pool_size, dim]``); in the backward
+    that is one local scatter-add plus one reduce-scatter. The chunk scan then pools and projects slices of the
+    gathered patches with the same per-chunk math as ``_forward_connector_maybe_chunked``.
+    """
+    b_dim, n_pooled, pool_size = pooled_patches_idx.shape
+    n_total, dim = image_features.shape[1], image_features.shape[2]
+    batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
+    cp_axis = self.config.context_sharding
+    cp_size = self.mesh.shape.get(cp_axis, 1)
+    sm = self.config.shard_mode
+    feat_spec = PartitionSpec(batch_axes, cp_axis, None)
+    pool_spec = PartitionSpec(batch_axes, cp_axis, None, None)
+    image_features = sharding.maybe_shard_with_pspec(image_features, feat_spec, self.mesh, sm)
+    pooled_patches_idx = sharding.maybe_shard_with_pspec(pooled_patches_idx, feat_spec, self.mesh, sm)
+
+    def _gather(f_loc, i_loc):
+      full = jax.lax.all_gather(f_loc, cp_axis, axis=1, tiled=True)
+      bl, npl, ps = i_loc.shape
+      safe = jnp.clip(i_loc, 0, max(n_total - 1, 0)).reshape(bl, npl * ps, 1)
+      return jnp.take_along_axis(full, safe, axis=1).reshape(bl, npl, ps, full.shape[-1])
+
+    to_pool = jax.shard_map(
+        _gather, mesh=self.mesh, in_specs=(feat_spec, feat_spec), out_specs=pool_spec, check_vma=False
+    )(image_features, pooled_patches_idx)
+    to_pool = sharding.maybe_shard_with_pspec(to_pool, pool_spec, self.mesh, sm)
+
+    pooled_per_rank = n_pooled // cp_size
+    chunk = int(getattr(self.config, "olmo_vit_crop_chunk_size", 0))
+    remat = bool(getattr(self.config, "olmo_vit_remat_blocks", True))
+    chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
+    skip_empty = bool(getattr(self.config, "olmo_connector_skip_empty_chunks", False))
+    chunk_pooled = 0
+    if chunk > 0:
+      for mult in (196, 128, 1):
+        cand = chunk * mult
+        if pooled_per_rank > cand and pooled_per_rank % cand == 0:
+          chunk_pooled = cand
+          break
+    if chunk_pooled == 0:
+      chunk_pooled = pooled_per_rank
+    n_chunks = pooled_per_rank // chunk_pooled
+    graphdef, state = nnx.split(self)
+
+    tp = to_pool.reshape(b_dim, cp_size, n_chunks, chunk_pooled, pool_size, dim)
+    tp = sharding.maybe_shard_with_pspec(
+        tp, PartitionSpec(batch_axes, cp_axis, None, None, None, None), self.mesh, sm
+    )
+    tp = jnp.transpose(tp, (2, 0, 1, 3, 4, 5))
+    ix = pooled_patches_idx.reshape(b_dim, cp_size, n_chunks, chunk_pooled, pool_size)
+    ix = sharding.maybe_shard_with_pspec(ix, PartitionSpec(batch_axes, cp_axis, None, None, None), self.mesh, sm)
+    ix = jnp.transpose(ix, (2, 0, 1, 3, 4))
+
+    def _run(st, tp_chunk, idx_chunk):
+      mod = nnx.merge(graphdef, st)
+      tp_flat = tp_chunk.reshape(b_dim, cp_size * chunk_pooled, pool_size, dim)
+      tp_flat = sharding.maybe_shard_with_pspec(tp_flat, pool_spec, self.mesh, sm)
+      idx_flat = idx_chunk.reshape(b_dim, cp_size * chunk_pooled, pool_size)
+      idx_flat = sharding.maybe_shard_with_pspec(idx_flat, feat_spec, self.mesh, sm)
+      out_flat = mod._pool_and_project(tp_flat, idx_flat, act_pspec=feat_spec)  # pylint: disable=protected-access
+      return out_flat.reshape(b_dim, cp_size, chunk_pooled, -1)
+
+    if skip_empty:
+      out_aval = jax.eval_shape(
+          _run,
+          state,
+          jax.ShapeDtypeStruct((b_dim, cp_size, chunk_pooled, pool_size, dim), to_pool.dtype),
+          jax.ShapeDtypeStruct((b_dim, cp_size, chunk_pooled, pool_size), pooled_patches_idx.dtype),
+      )
+      out_chunk_spec = PartitionSpec(batch_axes, cp_axis, None, None)
+
+      def _skip(st, tp_chunk, idx_chunk):
+        del st, tp_chunk, idx_chunk
+        return sharding.maybe_shard_with_pspec(jnp.zeros(out_aval.shape, out_aval.dtype), out_chunk_spec, self.mesh, sm)
+
+      def _scan_body(carry, xs):
+        tp_chunk, idx_chunk = xs
+        return carry, jax.lax.cond(jnp.any(idx_chunk >= 0), _run, _skip, carry, tp_chunk, idx_chunk)
+
+    else:
+
+      def _scan_body(carry, xs):
+        tp_chunk, idx_chunk = xs
+        return carry, _run(carry, tp_chunk, idx_chunk)
+
+    scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if chunk_remat else _scan_body
+    _, out_chunks = jax.lax.scan(scan_fn, state, (tp, ix))
+    return jnp.transpose(out_chunks, (1, 2, 0, 3, 4)).reshape(b_dim, n_pooled, -1)
 
   def _forward_connector_maybe_chunked(
       self,
@@ -789,7 +896,8 @@ class OLMo35VisionConnector(nnx.Module):
           out_flat = mod._forward_connector(image_features, idx_flat, act_pspec=flat_pspec)  # pylint: disable=protected-access
           return carry, out_flat.reshape(b_dim, cp_size, chunk_pooled, -1)
 
-        scan_fn_cp = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body_cp) if remat else _scan_body_cp
+        chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
+        scan_fn_cp = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body_cp) if chunk_remat else _scan_body_cp
         _, out_chunks = jax.lax.scan(scan_fn_cp, state, chunked)
         return jnp.transpose(out_chunks, (1, 2, 0, 3, 4)).reshape(b_dim, n_pooled, -1)
 
@@ -849,6 +957,22 @@ class OLMo35VisionConnector(nnx.Module):
     cp_axis = self.config.context_sharding
     cp_size = self.mesh.shape.get(cp_axis, 1) if self.mesh is not None else 1
     n_pooled = pooled_patches_idx.shape[1]
+    if (
+        bool(self.config.olmo_vit_cp_shard_crops)
+        and bool(getattr(self.config, "olmo_connector_gather_once", False))
+        and cp_size > 1
+        and n_pooled % cp_size == 0
+        and n_total % cp_size == 0
+    ):
+      batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
+      out = self._forward_connector_gather_once(image_features, pooled_patches_idx)
+      out = sharding.maybe_shard_with_pspec(
+          out, PartitionSpec(batch_axes, cp_axis, None), self.mesh, self.config.shard_mode
+      )
+      return sharding.maybe_shard_with_pspec(
+          out, PartitionSpec(batch_axes, None, None), self.mesh, self.config.shard_mode
+      )
+
     if bool(self.config.olmo_vit_cp_shard_crops) and cp_size > 1 and n_pooled % cp_size == 0:
       batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
       image_features = sharding.maybe_shard_with_pspec(
