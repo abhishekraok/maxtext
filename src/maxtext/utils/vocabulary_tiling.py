@@ -320,7 +320,7 @@ def _fused_ce_config_from(config) -> fused_ce.FusedCEConfig:
   )
 
 
-def fused_lm_head_ce_nnx_loss(model, hidden_states, data, config, is_train):
+def fused_lm_head_ce_nnx_loss(model, hidden_states, data, config, is_train, per_row=False):
   """Cross-entropy loss via the fused LM-head + CE Pallas kernel (`fused_lm_head_ce=True`).
 
   Applies the decoder's final norm (and dropout) in XLA, then runs the untied LM-head
@@ -338,8 +338,11 @@ def fused_lm_head_ce_nnx_loss(model, hidden_states, data, config, is_train):
     config: Model and training config.
     is_train: Whether the model is in training mode.
 
+    per_row: Also return each row's CE token sum without the z-loss (``[B]``, gradient stopped; logging only).
+
   Returns:
-    A tuple ``(total_loss, total_z_loss)`` of token sums (not normalized).
+    A tuple ``(total_loss, total_z_loss)`` of token sums (not normalized); with ``per_row``,
+    ``(total_loss, total_z_loss, row_ce_sums)``.
   """
   if config.logits_via_embedding:
     raise ValueError("fused_lm_head_ce requires an untied LM head (logits_via_embedding=False).")
@@ -381,4 +384,7 @@ def fused_lm_head_ce_nnx_loss(model, hidden_states, data, config, is_train):
       z_loss=config.z_loss_multiplier,
       cfg=_fused_ce_config_from(config),
   )
+  if per_row:
+    row_ce = jax.lax.stop_gradient(jnp.sum(loss - z_loss, axis=-1))
+    return jnp.sum(loss), jnp.sum(z_loss), row_ce
   return jnp.sum(loss), jnp.sum(z_loss)

@@ -196,6 +196,24 @@ def _document_segment_mask(inputs_segmentation, targets_segmentation, max_segmen
   untrained_in_seg = jnp.take_along_axis(per_seg, seg, axis=1)
   return (inputs_segmentation > 0) & (untrained_in_seg <= 1)
 
+def image_row_mask(pooled_patches_idx):
+  """[B] bool: rows holding an image (any pooled patch index >= 0; text rows are all -1)."""
+  return jnp.any(pooled_patches_idx >= 0, axis=tuple(range(1, pooled_patches_idx.ndim)))
+
+
+def text_image_ce(aux, ce):
+  """(ce_text, tokens_text, ce_img, tokens_img) from loss_fn's row-split sums (summed over microbatches).
+
+  A group without loss tokens reads 0; with no image tokens ce_text is the step's ce itself (and vice versa).
+  """
+  wt, wi = aux["weights_text"], aux["weights_img"]
+  ce_text = jnp.where(wi > 0, aux["ce_text_sum"] / jnp.maximum(wt, EPS), ce)
+  ce_img = jnp.where(wt > 0, aux["ce_img_sum"] / jnp.maximum(wi, EPS), ce)
+  ce_text = jnp.where(wt > 0, ce_text, 0.0)
+  ce_img = jnp.where(wi > 0, ce_img, 0.0)
+  return ce_text, wt, ce_img, wi
+
+
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
   """loss_fn for both train and eval.
 
@@ -332,6 +350,16 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     data = dict(data, loss_weights=active_lw * seq_w)
 
   doc_ce_aux = None
+  # log_loss_parts on a multimodal batch: also the CE of text rows and of image rows (rows with any pooled patch index
+  # >= 0), from the same per-token losses and loss weights as the step's CE. Logging only: stop-gradient, aux only.
+  split_rows = (
+      is_train
+      and getattr(config, "log_loss_parts", False)
+      and config.use_multimodal
+      and not is_block_diffusion
+      and data.get("pooled_patches_idx") is not None
+  )
+  row_ce = None
   is_dense_warmup = config.use_indexer and config.indexer_loss_scaling_factor > 0.0 and not config.indexer_sparse_training
   if is_dense_warmup and is_train:
     # In Dense Warm-up stage, we skip main model loss calculation for efficiency.
@@ -343,7 +371,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   elif getattr(config, "fused_lm_head_ce", False) and not is_block_diffusion:
     hidden_state_key = ("decoder", "hidden_states")
     hidden_states = maxtext_utils.get_nested_value(intermediate_outputs, hidden_state_key)[0]
-    xent_sum, total_z_loss = fused_lm_head_ce_nnx_loss(model, hidden_states, data, config, is_train)
+    if split_rows:
+      xent_sum, total_z_loss, row_ce = fused_lm_head_ce_nnx_loss(
+          model, hidden_states, data, config, is_train, per_row=True
+      )
+    else:
+      xent_sum, total_z_loss = fused_lm_head_ce_nnx_loss(model, hidden_states, data, config, is_train)
     if is_train and _LOG_DOC_CE:
       # Logging only (MAXTEXT_LOG_DOC_CE=1): CE of document-role segments (pretraining-style rows such as long-context
       # replay, every token trained) separately from chat segments, to compare per-source CE with GPU runs whose
@@ -402,6 +435,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
 
     xent_sum = jnp.sum(xent)
     total_z_loss = jnp.sum(z_loss)
+    if split_rows:
+      row_ce = jax.lax.stop_gradient(jnp.sum(xent - z_loss, axis=-1))
 
   if is_block_diffusion:
     assert targets_loss_mask is not None
@@ -410,6 +445,22 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     total_weights = jnp.sum(jnp.maximum(data["loss_weights"].astype(jnp.float32), 0.0))
   else:
     total_weights = jnp.sum(data["targets_segmentation"] != 0)
+  row_split_aux = None
+  if row_ce is not None:
+    # Per-row loss-weight sums, formed as total_weights is (the two groups add up to it).
+    if "loss_weights" in data and data["loss_weights"] is not None:
+      row_weights = jnp.sum(jnp.maximum(data["loss_weights"].astype(jnp.float32), 0.0), axis=-1)
+    else:
+      row_weights = jnp.sum((data["targets_segmentation"] != 0).astype(jnp.float32), axis=-1)
+    is_img = image_row_mask(data["pooled_patches_idx"])
+    weights_img = jnp.sum(jnp.where(is_img, row_weights, 0.0))
+    row_split_aux = {
+        "ce_text_sum": jnp.sum(jnp.where(is_img, 0.0, row_ce)),
+        # As the remainder, so that a batch without image rows has exactly the step's token count.
+        "weights_text": jnp.asarray(total_weights, jnp.float32) - weights_img,
+        "ce_img_sum": jnp.sum(jnp.where(is_img, row_ce, 0.0)),
+        "weights_img": weights_img,
+    }
   # If gradient accumulation is enabled, we don't need to divide xent_sum
   # by total_weights and then multiply the computed gradient by total_weights,
   # since it's equivalent to computing the gradient from xent_sum.
@@ -549,6 +600,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   }
   if doc_ce_aux is not None:
     aux.update(doc_ce_aux)
+  if row_split_aux is not None:
+    aux.update(row_split_aux)
   te_moe_block = getattr(config, "te_moe_block", False)
   if te_moe_block:
     overflow_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_capacity_overflow")
@@ -997,6 +1050,14 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       extra_metrics[f"{block}/router_z_loss_unscaled"] = router_z[i] / _OLMOE3_ROUTER_Z_LOSS_WEIGHT
       extra_metrics[f"{block}/load_imbalance"] = imbalance[i]
       extra_metrics[f"{block}/global_load_imbalance"] = global_imbalance[i]
+  if "ce_text_sum" in aux:
+    ce_text, tokens_text, ce_img, tokens_img = text_image_ce(aux, lm_loss - z_loss)
+    extra_metrics.update({
+        "learning/ce_text": ce_text,
+        "learning/tokens_text": tokens_text,
+        "learning/ce_img": ce_img,
+        "learning/tokens_img": tokens_img,
+    })
   scalar_metrics = {
       "learning/loss": loss,
       "learning/lm_loss": lm_loss,
@@ -1174,9 +1235,9 @@ def _maybe_log_loss_parts(config, step, metrics):
   """
   if not getattr(config, "log_loss_parts", False) or jax.process_index() != 0:
     return
-  _PENDING_LOSS_PARTS.append((step, {k: metrics["scalar"][k] for k in ("learning/lm_loss", "learning/z_loss",
-                                                                      "learning/moe_lb_loss", "learning/total_weights")
-                                     if k in metrics.get("scalar", {})}))
+  keys = ("learning/lm_loss", "learning/z_loss", "learning/moe_lb_loss", "learning/total_weights", "learning/ce_text",
+          "learning/tokens_text", "learning/ce_img", "learning/tokens_img")
+  _PENDING_LOSS_PARTS.append((step, {k: metrics["scalar"][k] for k in keys if k in metrics.get("scalar", {})}))
   while len(_PENDING_LOSS_PARTS) > 1 or (_PENDING_LOSS_PARTS and step >= config.steps - 1):
     _log_loss_parts_line(*_PENDING_LOSS_PARTS.pop(0))
 
@@ -1187,7 +1248,14 @@ def _log_loss_parts_line(step, scalars):
   lm, z = float(vals.get("learning/lm_loss", 0.0)), float(vals.get("learning/z_loss", 0.0))
   lb, weights = float(vals.get("learning/moe_lb_loss", 0.0)), float(vals.get("learning/total_weights", 0.0))
   # lm_loss includes the z-loss (cross_entropy_with_logits adds it to every token's loss).
-  max_logging.log(f"LOSS-PARTS step={step + 1} ce={lm - z:.6f} moe_lb={lb:.6f} z={z:.6f} tokens={weights:.0f}")
+  line = f"LOSS-PARTS step={step + 1} ce={lm - z:.6f} moe_lb={lb:.6f} z={z:.6f} tokens={weights:.0f}"
+  if "learning/ce_text" in vals:
+    # Multimodal batches: CE of text rows and of image rows (rows with an image), same loss weights as ce.
+    line += (
+        f" ce_text={float(vals['learning/ce_text']):.6f} tokens_text={float(vals['learning/tokens_text']):.0f}"
+        f" ce_img={float(vals['learning/ce_img']):.6f} tokens_img={float(vals['learning/tokens_img']):.0f}"
+    )
+  max_logging.log(line)
 
 
 def required_rbf_log_lines(config, step, probe, suffix=""):
