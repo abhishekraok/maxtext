@@ -22,6 +22,7 @@ from functools import partial
 from typing import Union, Sequence
 from collections.abc import Iterator, Iterable
 import gc
+import hashlib
 import time
 import json
 import weakref
@@ -223,6 +224,35 @@ def _form_global_array(path, array: np.ndarray, global_mesh: Mesh) -> jax.Array:
   return jax.make_array_from_single_device_arrays(global_shape, sharding, local_device_buffers)
 
 
+_LOG_BATCH_HASH = os.environ.get("MAXTEXT_LOG_BATCH_HASH", "") == "1"
+_DATA_STATE_DIR = os.environ.get("MAXTEXT_DATA_STATE_DIR", "")
+
+
+def _log_batch_hash(iterator, local_data):
+  """Logging only: one line per local batch this host pulls (resume skips included), with the sha256 of every array in
+  it, keys sorted, so a resumed run's batches can be compared with an uninterrupted run's or a CPU rebuild's."""
+  n = getattr(iterator, "_batch_hash_n", 0) + 1
+  iterator._batch_hash_n = n  # pylint: disable=protected-access
+  h = hashlib.sha256()
+  for key in sorted(local_data):
+    a = np.ascontiguousarray(np.asarray(local_data[key]))
+    h.update(f"{key}:{a.dtype.str}:{a.shape}".encode())
+    h.update(a.tobytes())
+  max_logging.log(f"BATCH-HASH n={n} host={jax.process_index()} sha256={h.hexdigest()}")
+  dump_dir = os.environ.get("MAXTEXT_DUMP_BATCHES_DIR", "")
+  if dump_dir and n <= int(os.environ.get("MAXTEXT_DUMP_BATCHES_N", "3")):
+    # Logging only: save this host's local batch n (every array) as npz, for offline label/mask checks.
+    try:
+      out = epath.Path(dump_dir) / f"host{jax.process_index():03d}_batch{n:03d}.npz"
+      import io  # pylint: disable=import-outside-toplevel
+      buf = io.BytesIO()
+      np.savez_compressed(buf, **{k: np.asarray(v) for k, v in local_data.items()})
+      out.write_bytes(buf.getvalue())
+      max_logging.log(f"BATCH-DUMP n={n} host={jax.process_index()} -> {out}")
+    except Exception as e:  # pylint: disable=broad-except
+      max_logging.log(f"BATCH-DUMP failed: {e}")
+
+
 class MultiHostDataLoadIterator:
   """fold get_next_batch_sharded into a iterator class.
   expansion_factor_for_grain is only used for grain pipeline when having a subset of hosts loading real data.
@@ -249,6 +279,36 @@ class MultiHostDataLoadIterator:
     self.generate_padding_batch = generate_padding_batch
     self.expansion_loading_factor_for_grain = expansion_loading_factor_for_grain
     _GLOBAL_MULTIHOST_ITERATORS.add(self)
+
+  def _record_raw_position(self):
+    """MAXTEXT_DATA_STATE_DIR: after each pulled batch, how many of this host's raw rows precede the next batch's first
+    row (the rows a resume must skip). Keyed by the 1-based count of batches pulled, offset by a fast resume."""
+    if not hasattr(self, "_raw_at"):
+      self._raw_at = {}
+      self._batches_pulled = int(os.environ.get("MAXTEXT_DATA_RESUMED_STEP", "0") or 0)
+      self._raw_offset = int(os.environ.get("MAXTEXT_DATA_SKIP_RAW", "0") or 0)
+      self._sampler_base = self._sampler_stride = None
+    self._batches_pulled += 1
+    try:
+      state = json.loads(self.local_iterator.get_state())
+      seen = state["last_seen_indices"]
+      # One loading worker here (worker_count <= 1): its last seen index. (worker_count 0 reports worker -1.)
+      idx = int(seen.get(str(state.get("last_worker_index")), max(seen.values())))
+      if self._sampler_base is None:
+        sampler = getattr(self.dataloader, "_sampler")
+        self._sampler_base = int(sampler[0].index)
+        self._sampler_stride = int(sampler[1].index) - self._sampler_base
+      pos = (idx - self._sampler_base) // self._sampler_stride
+      # Measured (CPU test, grain PackAndBatchOperation): the next batch starts at raw row `pos` (0-based), i.e. the
+      # packed batch's metadata index is that of the row which closed it; resuming must skip exactly `pos` rows.
+      self._raw_at[self._batches_pulled] = self._raw_offset + pos
+      if os.environ.get("MAXTEXT_DATA_DEBUG_DIR"):
+        max_logging.log(f"DATA-POS batch={self._batches_pulled} raw={self._raw_at[self._batches_pulled]} idx={idx}")
+    except Exception as e:  # pylint: disable=broad-except
+      max_logging.log(f"DATA-STATE: could not read the loader position: {e!r}")
+    # Keep only recent entries.
+    for k in [k for k in self._raw_at if k < self._batches_pulled - 64]:
+      del self._raw_at[k]
 
   def reset(self):
     if hasattr(self.dataloader, "as_numpy_iterator"):
@@ -327,6 +387,10 @@ class MultiHostDataLoadIterator:
         raise TimeoutError(f"Failed to load data after {MAX_DATA_LOAD_ATTEMPTS} retry attempts.")
 
       self.last_local_data = local_data
+    if _DATA_STATE_DIR and not (self.out_of_data and self.generate_padding_batch):
+      self._record_raw_position()
+    if _LOG_BATCH_HASH:
+      _log_batch_hash(self, local_data)
     if jax.process_count() == 1:
       sharding = NamedSharding(self.global_mesh, PartitionSpec(self.global_mesh.axis_names))
       input_gdas = jax.device_put(local_data, sharding)
@@ -536,3 +600,37 @@ class RemoteIteratorWrapper:
     step_array = jnp.array(step, dtype=jnp.int32)
     step_array = jax.device_put(step_array, replicated_cpu_sharding)
     self.local_iterator.restore_state(step_array)  # pyrefly: ignore[missing-attribute]
+
+
+def write_data_state(step: int) -> None:
+  """Writes this host's raw-row position for trained step `step` to MAXTEXT_DATA_STATE_DIR/step{step}/host{p}.json."""
+  if not _DATA_STATE_DIR:
+    return
+  for it in list(_GLOBAL_MULTIHOST_ITERATORS):
+    raw_at = getattr(it, "_raw_at", None)
+    if raw_at and step in raw_at:
+      out = epath.Path(_DATA_STATE_DIR) / f"step{step:07d}" / f"host{jax.process_index():04d}.json"
+      out.parent.mkdir(parents=True, exist_ok=True)
+      out.write_text(json.dumps({"step": step, "raw_rows_consumed": int(raw_at[step]), "host": jax.process_index()}))
+      max_logging.log(f"DATA-STATE step={step} raw_rows_consumed={raw_at[step]} -> {out}")
+      return
+  max_logging.log(f"DATA-STATE: no recorded position for step {step} on this host")
+
+
+def read_data_state_for_resume(checkpoint_dir: str):
+  """Latest step S with a committed checkpoint and this host's data-state file; returns (S, raw rows) or None."""
+  if not _DATA_STATE_DIR or not checkpoint_dir:
+    return None
+  ckpt = epath.Path(checkpoint_dir)
+  if not ckpt.exists():
+    return None
+  steps = sorted((int(p.name) for p in ckpt.iterdir() if p.name.isdigit()), reverse=True)
+  for step in steps:
+    if not (ckpt / str(step) / "commit_success.txt").exists():
+      continue  # uncommitted (e.g. a save interrupted by a crash): Orbax will not restore it either
+    f = epath.Path(_DATA_STATE_DIR) / f"step{step:07d}" / f"host{jax.process_index():04d}.json"
+    if f.exists():
+      d = json.loads(f.read_text())
+      return step, int(d["raw_rows_consumed"])
+    return None
+  return None

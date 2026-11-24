@@ -24,6 +24,7 @@ import time
 from typing import Any
 
 from etils import epath
+import numpy as np
 from flax import nnx
 from flax.nnx import variablelib
 from flax import struct
@@ -1351,10 +1352,143 @@ def load_params_from_path(
   # offered? Compare against what is ON DISK; comparing against the restored tree can never
   # differ, because the restore only ever returns what was requested.
   _log_unconsumed_checkpoint_weights(want, audit_stored)
+  restored_weights = _maybe_seed_embedding_rows(restored_weights)
   if is_nnx:
     nnx.replace_by_pure_dict(abstract_unboxed_params, restored_weights)
     return abstract_unboxed_params
   return restored_weights
+
+
+def _maybe_round_params_to_bf16(weights, tag=""):
+  """MAXTEXT_ROUND_PARAMS_BF16=1: round every floating-point weight to bfloat16 and back to its own dtype.
+  MAXTEXT_ROUND_PARAMS_BF16=report: change nothing, only log how far the weights are from the bf16 grid.
+
+  Matches OLMo-core SFT (e.g. H203), whose fp32 optimizer masters are initialised from the bf16 model params
+  (checkpoint loaded into bf16 params, then copied up to fp32), so every master starts on the bf16 grid. Used before and
+  after MAXTEXT_SEED_ROWS, as OLMo-core seeds the promoted rows into the bf16 params. Unset: no change.
+  Both modes log, per array kind, the fraction of elements off the bf16 grid and the max relative change.
+  """
+  mode = os.environ.get("MAXTEXT_ROUND_PARAMS_BF16", "")
+  if mode not in ("1", "report"):
+    return weights
+  stats = []
+
+  def rnd(path, x):
+    if not hasattr(x, "dtype") or not jnp.issubdtype(x.dtype, jnp.floating) or x.dtype == jnp.bfloat16:
+      return x
+    sharding = getattr(x, "sharding", None)
+    def _rnd(a):
+      # Integer round-to-nearest-even to the bf16 grid: XLA may elide an f32->bf16->f32 convert pair
+      # (xla_allow_excess_precision), which made the earlier astype-based version a silent no-op.
+      if a.dtype != jnp.float32:
+        return a.astype(jnp.bfloat16).astype(a.dtype)
+      u = jax.lax.bitcast_convert_type(a, jnp.uint32)
+      u = (u + jnp.uint32(0x7FFF) + ((u >> 16) & jnp.uint32(1))) & jnp.uint32(0xFFFF0000)
+      return jax.lax.bitcast_convert_type(u, jnp.float32)
+
+    r = jax.jit(_rnd, out_shardings=sharding)(x)
+    off = float(jnp.mean((r != x).astype(jnp.float32)))
+    rel = float(jnp.max(jnp.abs(r - x) / jnp.maximum(jnp.abs(x), 1e-30)))
+    stats.append((jax.tree_util.keystr(path), tuple(x.shape), off, rel))
+    return r if mode == "1" else x
+
+  weights = jax.tree_util.tree_map_with_path(rnd, weights)
+  n_off = sum(1 for _, _, off, _ in stats if off > 0)
+  max_logging.log(
+      f"MAXTEXT_ROUND_PARAMS_BF16={mode}{tag}: {len(stats)} floating arrays, {n_off} with elements off the bf16 grid"
+      + ("" if mode == "1" else " (report only, unchanged)")
+  )
+  for name, shape, off, rel in sorted(stats, key=lambda t: -t[2])[:8] + [t for t in stats if any(k in t[0] for k in ("norm", "gate", "router"))][:8]:
+    max_logging.log(f"  BF16-GRID {name} {shape} off_grid_frac={off:.4f} max_rel_change={rel:.2e}")
+  return weights
+
+
+def _maybe_permute_experts(weights):
+  """MAXTEXT_EXPERT_PERM=<npz>: reorder each MoE layer's routed experts at load (math-identical relabelling).
+
+  The npz maps "layers_<k>" to an int array perm of length E: new expert i is old expert perm[i]. Applied to the
+  layer's router (moe_block/gate/kernel columns, gate/bias if present) and expert weights (moe_block/wi_0, wi_1, wi,
+  wo along axis 0). Routing, the load-balance loss and expert compute are permutation-equivariant, so only which
+  expert-parallel group holds which expert changes. A checkpoint saved by such a run is in the permuted order:
+  apply argsort(perm) before using it elsewhere. Unset: no change.
+  """
+  path = os.environ.get("MAXTEXT_EXPERT_PERM", "").strip()
+  if not path:
+    return weights
+  import io  # pylint: disable=import-outside-toplevel
+  z = np.load(io.BytesIO(epath.Path(path).read_bytes()))
+  perms = {k: np.asarray(z[k]).astype(np.int32) for k in z.files if k.startswith("layers_")}
+  done = []
+
+  def take(arr, perm, axis):
+    sharding = getattr(arr, "sharding", None)
+    idx = jnp.asarray(perm)
+    return jax.jit(lambda a: jnp.take(a, idx, axis=axis), out_shardings=sharding)(arr)
+
+  dec = weights.get("decoder", {}) if isinstance(weights, dict) else {}
+  for layer, perm in perms.items():
+    blk = dec.get(layer, {}).get("moe_block") if isinstance(dec.get(layer), dict) else None
+    if blk is None:
+      raise ValueError(f"MAXTEXT_EXPERT_PERM: no decoder/{layer}/moe_block in the checkpoint")
+    if sorted(perm.tolist()) != list(range(len(perm))):
+      raise ValueError(f"MAXTEXT_EXPERT_PERM: {layer} is not a permutation")
+    gate = blk.get("gate", {})
+    if "kernel" in gate:
+      gate["kernel"] = take(gate["kernel"], perm, -1)
+    if "bias" in gate:
+      gate["bias"] = take(gate["bias"], perm, -1)
+    for name in ("wi_0", "wi_1", "wi", "wo"):
+      if name in blk:
+        if blk[name].shape[0] != len(perm):
+          raise ValueError(f"MAXTEXT_EXPERT_PERM: {layer}/{name} has {blk[name].shape[0]} experts, perm {len(perm)}")
+        blk[name] = take(blk[name], perm, 0)
+    done.append(layer)
+  max_logging.log(f"MAXTEXT_EXPERT_PERM {path}: permuted experts in {len(done)} layers")
+  return weights
+
+
+def _maybe_seed_embedding_rows(weights):
+  """Seed promoted-token rows as the fp32 mean of their piece rows (OLMo SFT `--reserved_slot_tokens`).
+
+  Driven by the env var MAXTEXT_SEED_ROWS, e.g. "100256:14023,771,29;100266:524,27963,29": each new row of the
+  input embedding (`token_embedder/embedding`, [V, D]) and of the untied output head (`logits_dense/kernel`, [D, V])
+  is set to the mean of the listed rows, computed in fp32 from the loaded weights (open-instruct
+  `model_utils.seed_embedding_rows`). Unset: no change.
+  """
+  spec_str = os.environ.get("MAXTEXT_SEED_ROWS", "").strip()
+  if not spec_str:
+    return weights
+  spec = []
+  for item in spec_str.split(";"):
+    new, src = item.split(":")
+    spec.append((int(new), [int(x) for x in src.split(",")]))
+
+  def seed(arr, axis):
+    a = arr.astype(jnp.float32)
+    for new, src in spec:
+      m = jnp.take(a, jnp.asarray(src), axis=axis).mean(axis=axis)
+      a = a.at[new].set(m) if axis == 0 else a.at[:, new].set(m)
+    return a.astype(arr.dtype)
+
+  hits = []
+
+  def walk(node, path):
+    if isinstance(node, dict):
+      return {k: walk(v, path + (str(k),)) for k, v in node.items()}
+    tail = path[-2:]
+    axis = 0 if tail == ("token_embedder", "embedding") else (1 if tail == ("logits_dense", "kernel") else None)
+    if axis is None or not hasattr(node, "shape"):
+      return node
+    sharding = getattr(node, "sharding", None)
+    out = jax.jit(seed, static_argnums=1, out_shardings=sharding)(node, axis)
+    hits.append(("/".join(path), tuple(node.shape), axis))
+    return out
+
+  weights = walk(weights, ())
+  max_logging.log(f"MAXTEXT_SEED_ROWS {spec_str}: seeded {len(hits)} matrices {hits}")
+  if len(hits) != 2:
+    raise ValueError(f"MAXTEXT_SEED_ROWS expected 2 matrices (embedding + untied head), seeded {hits}")
+  return weights
 
 
 def save_params_to_path(checkpoint_dir, params, use_ocdbt=True, use_zarr3=True):

@@ -16,6 +16,7 @@
 
 from collections import defaultdict
 import abc
+import os
 from typing import override
 
 import jax
@@ -248,15 +249,63 @@ class BaseDataHooks(DataHooks):
 
   def __init__(self, config, mesh, goodput_recorder):
     self.config = config
-    self.train_data_iterator, self.eval_data_iterator = create_data_iterator(config, mesh)
+    self._fast_resume_step = 0
+    if os.environ.get("MAXTEXT_FAST_RESUME") == "1" and not os.environ.get("MAXTEXT_PREPACKED_DIR"):
+      # Fast resume: skip this host's already-trained raw rows inside the stream (no tokenization or packing)
+      # instead of replaying every trained batch. Needs MAXTEXT_SFT_GRAIN_TEMPLATE=1 and the per-save data-state
+      # files written by the save hook (MAXTEXT_DATA_STATE_DIR).
+      from maxtext.input_pipeline import multihost_dataloading  # pylint: disable=import-outside-toplevel
+
+      found = multihost_dataloading.read_data_state_for_resume(getattr(config, "checkpoint_dir", ""))
+      if found:
+        self._fast_resume_step, raw = found
+        os.environ["MAXTEXT_DATA_SKIP_RAW"] = str(raw)
+        os.environ["MAXTEXT_DATA_RESUMED_STEP"] = str(self._fast_resume_step)
+        max_logging.log(f"FAST-RESUME: step {self._fast_resume_step}, skipping {raw} raw rows on this host")
+    if os.environ.get("MAXTEXT_PREPACKED_DIR"):
+      # Same-batch parity runs: another trainer's packed batches, one file per step (input_pipeline/prepacked.py).
+      from maxtext.input_pipeline.prepacked import PrepackedIterator  # pylint: disable=import-outside-toplevel
+
+      self.train_data_iterator, self.eval_data_iterator = PrepackedIterator(config, mesh), None
+    else:
+      self.train_data_iterator, self.eval_data_iterator = create_data_iterator(config, mesh)
     self.train_data_loader = DataLoader(config, mesh, self.train_data_iterator, goodput_recorder=goodput_recorder)
     self.train_batch = None
     self.eval_batch = None
+    self._resume_skip_done = False
+
+  def _skip_trained_batches(self, train_ctx: peft_trainer.PeftTrainer):
+    """On resume, discards the batches the restored checkpoint already trained on.
+
+    Tunix skips them itself only when no data hooks are set, and the streaming iterators are not checkpointed, so
+    without this a resumed run replays the data from the start.
+    """
+    self._resume_skip_done = True
+    n = train_ctx._iter_steps  # pylint: disable=protected-access
+    if self._fast_resume_step:
+      if n < self._fast_resume_step:
+        raise ValueError(
+            f"FAST-RESUME: the trainer restored step {n}, older than the data state for step {self._fast_resume_step}"
+        )
+      max_logging.log(f"FAST-RESUME: trainer at step {n}; replaying {n - self._fast_resume_step} batches")
+      n -= self._fast_resume_step
+    if n <= 0:
+      return
+    if hasattr(self.train_data_iterator, "skip_steps"):
+      # Pre-packed step files (MAXTEXT_PREPACKED_DIR): jump straight to the next step's file.
+      self.train_data_iterator.skip_steps(n)
+      return
+    start = time.perf_counter()
+    for _ in range(n):
+      self.train_data_loader.load_next_batch_pre_sharding()
+    max_logging.log(f"Resume: skipped {n} already-trained batches in {time.perf_counter() - start:.1f}s")
 
   @override
-  def load_next_train_batch(self, train_ctx: peft_trainer.PeftTrainer):  # pylint: disable=unused-argument
+  def load_next_train_batch(self, train_ctx: peft_trainer.PeftTrainer):
     """Loads the next batch of data for training."""
     try:
+      if not self._resume_skip_done:
+        self._skip_trained_batches(train_ctx)
       self.train_batch = self.train_data_loader.load_next_batch()
     except exceptions.StopTraining as e:
       if isinstance(e.__cause__ or e.__context__, StopIteration):
