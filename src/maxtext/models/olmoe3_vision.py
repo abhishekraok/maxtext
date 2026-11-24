@@ -65,7 +65,7 @@ def _normal_kernel_init(stddev: float = 0.02):
 
 def _vit_kernel_axes(in_f: int, out_f: int, config: Config, mesh: Mesh | None) -> tuple[str | None, str | None]:
   """Selects divisible logical sharding axes for ViT and Connector ``DenseGeneral`` kernels."""
-  if mesh is None:
+  if mesh is None or bool(getattr(config, "olmo_vit_replicate_weights", False)):
     return (None, None)
   for axis_name in ("vit_embed_cp", "vit_embed"):
     spec = sharding.logical_to_mesh_axes((axis_name,), mesh, rules=config.logical_axis_rules)

@@ -4266,6 +4266,14 @@ class VisionTower(BaseModel):
       True,
       description="Under Context Parallelism, encode N_crops // CP crops per CP rank and AllGather.",
   )
+  olmo_vit_replicate_weights: bool = Field(
+      False,
+      description=(
+          "Replicate the OLMo 3.5 ViT and connector DenseGeneral kernels on every device instead of sharding them "
+          "over vit_embed_cp / vit_embed, so the vision tower does no per-layer weight all-gather. A workaround for "
+          "the v4 8x8x8 whose gathered ViT weights arrived corrupted on fixed chips (2026-11-24)."
+      ),
+  )
   olmo_vit_outer_remat: bool = Field(
       True,
       description=(
