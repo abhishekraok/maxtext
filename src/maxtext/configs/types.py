@@ -3135,6 +3135,14 @@ class OlmoGrainDataset(BaseModel):
           "background thread while the current step runs. Same batches in the same order."
       ),
   )
+  olmo_mm_keep_sources: list[str] = Field(
+      default_factory=list,
+      description=(
+          "olmo_mm live loader: if non-empty, train only these sources of the OLMo-core config (its dataset.sources, "
+          "target_loss_mass and mean_loss_weight cut to these names). Empty trains every source. The images-off arm "
+          "of a multimodal SFT: the text source names only."
+      ),
+  )
   olmo_mm_batch_hash_steps: NonNegativeInt = Field(
       0,
       description=(

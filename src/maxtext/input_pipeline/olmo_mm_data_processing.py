@@ -1334,6 +1334,41 @@ def resolve_olmo_mm_config_path(cfg_path: str) -> str:
   return candidate if os.path.exists(candidate) else cfg_path
 
 
+def write_source_subset_config(cfg_path: str, keep_sources: List[str], out_dir: str) -> str:
+  """``olmo_mm_keep_sources``: a copy of the OLMo-core config at ``cfg_path`` whose ``dataset`` keeps only the named
+  sources (in their original order), with ``target_loss_mass`` and ``mean_loss_weight`` cut to the same names.
+  Written to ``out_dir`` and returned; the loader (in-process or producer) then reads it like any config.
+
+  The images-off arm of a multimodal run: keep only the text source(s), everything else (loader seed, packing, the
+  text sources' own settings, the model with its vision tower) unchanged. OLMo-core sets the sampling weights from
+  ``target_loss_mass / mean_loss_weight``, so the kept sources keep their relative shares.
+  """
+  raw_cfg = json.loads(epath.Path(cfg_path).read_text())
+  ds = raw_cfg["dataset"]
+  sources = ds.get("sources") or {}
+  missing = [name for name in keep_sources if name not in sources]
+  if missing:
+    raise ValueError(f"olmo_mm_keep_sources: {missing} not among the config's sources {list(sources)}.")
+  keep = [name for name in sources if name in set(keep_sources)]
+  ds["sources"] = {name: sources[name] for name in keep}
+  for key in ("target_loss_mass", "mean_loss_weight"):
+    if isinstance(ds.get(key), dict) and ds[key]:
+      ds[key] = {name: ds[key][name] for name in keep if name in ds[key]}
+  dropped = [name for name in sources if name not in set(keep)]
+  Path(out_dir).mkdir(parents=True, exist_ok=True)
+  digest = hashlib.sha256(json.dumps(raw_cfg, sort_keys=True).encode()).hexdigest()[:12]
+  out_path = os.path.join(out_dir, f"olmo_mm_config_keep_{digest}.json")
+  tmp = f"{out_path}.tmp{os.getpid()}"
+  with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(raw_cfg, fh, indent=2)
+  os.replace(tmp, out_path)
+  max_logging.log(
+      f"olmo_mm_keep_sources: training {keep} of {cfg_path}; dropped {len(dropped)} source(s) {dropped}; "
+      f"config written to {out_path}"
+  )
+  return out_path
+
+
 def host_loaded_global_rows(global_mesh, global_batch_size_to_load: int, max_target_length: int) -> List[int]:
   """Global batch rows this host loads, in local batch order.
 
@@ -1725,6 +1760,13 @@ def _make_mm_loader_for_host(
 
   batches_dir = (getattr(config, "olmo_mm_batches_dir", "") or "").strip()
   cfg_path = resolve_olmo_mm_config_path((getattr(config, "olmo_mm_config_path", "") or "").strip())
+  keep_sources = [str(name) for name in (getattr(config, "olmo_mm_keep_sources", None) or [])]
+  if keep_sources and not batches_dir:
+    if not cfg_path:
+      raise ValueError("olmo_mm_keep_sources needs olmo_mm_config_path.")
+    cfg_path = write_source_subset_config(
+        cfg_path, keep_sources, (getattr(config, "olmo_mm_work_dir", "") or "/tmp/olmo_mm_work").strip()
+    )
   if batches_dir:
     max_logging.log(
         f"OLMo MM pre-exported batch loader: dir={batches_dir} shard={shard_index}/{shard_count} "
