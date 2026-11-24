@@ -128,6 +128,34 @@ def patchify_hwc_to_olmo_cfirst(images_hwc: jax.Array, patch_size: int = 14) -> 
   return patches.reshape(b, n_crops, gh * gw, c * p * p)
 
 
+def olmo35_crop_valid(pooled_patches_idx: jax.Array, n_crops: int, patches_per_crop: int) -> jax.Array:
+  """``[B, N_crops]`` bool: crop ``c`` of row ``b`` is below ``n_used[b] = max(pooled_patches_idx[b]) // P + 1``.
+
+  The connector reads only crops ``< n_used`` (every valid pooled index points into them); crops at or above it are
+  padding (text rows: all of them).
+  """
+  idx = pooled_patches_idx.astype(jnp.int32)
+  has_any = jnp.any(idx >= 0, axis=tuple(range(1, idx.ndim)))
+  n_used = jnp.where(has_any, jnp.max(idx, axis=tuple(range(1, idx.ndim))) // int(patches_per_crop) + 1, 0)
+  n_used = jnp.minimum(n_used, n_crops).astype(jnp.int32)
+  return jnp.arange(n_crops, dtype=jnp.int32)[None, :] < n_used[:, None]
+
+
+def _select_crops(x: jax.Array, crop_valid: jax.Array) -> jax.Array:
+  """Zeros (by selection, so NaN / inf / garbage never survive) the crops of ``x`` ``[B, N_crops, ...]`` where
+  ``crop_valid`` ``[B, N_crops]`` is False."""
+  mask = crop_valid.reshape(crop_valid.shape + (1,) * (x.ndim - 2))
+  return jnp.where(mask, x, jnp.zeros((), x.dtype))
+
+
+def params_nonfinite_count(module: nnx.Module) -> jax.Array:
+  """log_nonfinite_probe: the number of non-finite entries over all ``nnx.Param`` leaves of ``module`` (int32 scalar)."""
+  total = jnp.zeros((), jnp.int32)
+  for leaf in jax.tree.leaves(nnx.state(module, nnx.Param)):
+    total = total + jnp.sum(jnp.logical_not(jnp.isfinite(leaf)), dtype=jnp.int32)
+  return total
+
+
 class _ViTLayerNorm(nnx.Module):
   """FP32 LayerNorm with weight and bias matching PyTorch ``nn.LayerNorm(eps=1e-6)``."""
 
@@ -557,8 +585,18 @@ class OLMo35VisionEncoder(nnx.Module):
     return jax.shard_map(_from_balanced, mesh=self.mesh, in_specs=bal_spec, out_specs=out_spec, check_vma=False)(feats)
 
   def __call__(
-      self, input_images: jax.Array, deterministic: bool = True, pooled_patches_idx: jax.Array | None = None
-  ) -> jax.Array:
+      self,
+      input_images: jax.Array,
+      deterministic: bool = True,
+      pooled_patches_idx: jax.Array | None = None,
+      return_probes: bool = False,
+  ):
+    """Encodes the crops; with ``pooled_patches_idx`` the padding crops (``>= n_used`` per row) are zeroed by selection
+    before the ViT (so their activations, which enter the ViT weight gradients, are finite whatever the pixel buffer
+    holds) and their features after it. Valid crops are unchanged.
+
+    ``return_probes``: also returns a dict of per-row int32 [B] counts (``log_nonfinite_probe``).
+    """
     del deterministic
     if input_images.ndim == 5:
       patches = patchify_hwc_to_olmo_cfirst(input_images, self.patch_size)
@@ -569,37 +607,69 @@ class OLMo35VisionEncoder(nnx.Module):
           f"OLMo35VisionEncoder expects [B, N_crops, P, 588] or [B, N_crops, H, W, 3], got {input_images.shape}."
       )
 
+    b_dim, n_crops, p = patches.shape[0], patches.shape[1], patches.shape[2]
+    crop_valid = None if pooled_patches_idx is None else olmo35_crop_valid(pooled_patches_idx, n_crops, p)
+    probes = {}
+    if return_probes:
+      probes["nonfinite_probe_vit_params"] = jnp.broadcast_to(params_nonfinite_count(self), (b_dim,))
+      # Pixels outside [-1, 1] (SigLIP range) or non-finite: catches finite garbage the plain non-finite count misses.
+      bad_px = jnp.logical_not(jnp.abs(patches.astype(jnp.float32)) <= 1.0 + 1e-3)
+      probes["nonfinite_probe_pixels_out_of_range"] = jnp.sum(bad_px, axis=(1, 2, 3), dtype=jnp.int32)
+
+    def _finish(out, feat_pspec):
+      # out: [B, N_crops * P, F]. Probe, then zero the padding crops' features by selection.
+      f_dim = out.shape[-1]
+      if return_probes:
+        bad = jnp.logical_not(jnp.isfinite(out)).reshape(b_dim, n_crops, p, f_dim)
+        probes["nonfinite_probe_vit_feats"] = jnp.sum(bad, axis=(1, 2, 3), dtype=jnp.int32)
+        if crop_valid is not None:
+          probes["nonfinite_probe_vit_feats_valid"] = jnp.sum(
+              jnp.logical_and(bad, crop_valid[:, :, None, None]), axis=(1, 2, 3), dtype=jnp.int32
+          )
+      if crop_valid is not None:
+        out = _select_crops(out.reshape(b_dim, n_crops, p, f_dim), crop_valid).reshape(b_dim, n_crops * p, f_dim)
+        if feat_pspec is not None and self.mesh is not None:
+          out = sharding.maybe_shard_with_pspec(out, feat_pspec, self.mesh, self.config.shard_mode)
+      return (out, probes) if return_probes else out
+
     cp_axis = self.config.context_sharding
     cp_size = self.mesh.shape.get(cp_axis, 1) if self.mesh is not None else 1
-    n_crops = patches.shape[1]
     if bool(self.config.olmo_vit_cp_shard_crops) and cp_size > 1 and n_crops % cp_size == 0:
       # Every CP rank shares the same sequence's `n_crops` images. Shard `patches` on `cp_axis`
       # in GSPMD so each CP rank encodes `n_crops // cp_size` crops while ViT weights stay
       # FSDP/EP-sharded (`vit_embed` / `vit_embed_cp`), then AllGather features across `cp_axis`.
       batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
-      patches = sharding.maybe_shard_with_pspec(
-          patches, PartitionSpec(batch_axes, cp_axis, None, None), self.mesh, self.config.shard_mode
-      )
+      in_pspec = PartitionSpec(batch_axes, cp_axis, None, None)
+      patches = sharding.maybe_shard_with_pspec(patches, in_pspec, self.mesh, self.config.shard_mode)
+      if crop_valid is not None:
+        patches = sharding.maybe_shard_with_pspec(
+            _select_crops(patches, crop_valid), in_pspec, self.mesh, self.config.shard_mode
+        )
       out = None
       if bool(getattr(self.config, "olmo_vit_balance_crops", False)) and pooled_patches_idx is not None:
         out = self._encode_balanced(patches, pooled_patches_idx)
       if out is None:
         out = self._encode_crops_maybe_chunked(patches, cp_sharded=True)
-      out = sharding.maybe_shard_with_pspec(
-          out, PartitionSpec(batch_axes, cp_axis, None), self.mesh, self.config.shard_mode
-      )
-      if bool(getattr(self.config, "olmo_connector_gather_once", False)):
-        # The connector all-gathers the features itself (and reduce-scatters their gradient).
-        return out
-      return sharding.maybe_shard_with_pspec(
-          out, PartitionSpec(batch_axes, None, None), self.mesh, self.config.shard_mode
-      )
+      cp_feat_pspec = PartitionSpec(batch_axes, cp_axis, None)
+      out = sharding.maybe_shard_with_pspec(out, cp_feat_pspec, self.mesh, self.config.shard_mode)
+      res = _finish(out, cp_feat_pspec)
+      out = res[0] if return_probes else res
+      if not bool(getattr(self.config, "olmo_connector_gather_once", False)):
+        out = sharding.maybe_shard_with_pspec(
+            out, PartitionSpec(batch_axes, None, None), self.mesh, self.config.shard_mode
+        )
+      # (olmo_connector_gather_once: the connector all-gathers the features itself and reduce-scatters their gradient.)
+      return (out, probes) if return_probes else out
 
     if self.mesh is not None:
       patches = sharding.maybe_shard_with_logical(
           patches, ("activation_batch", None, None, None), self.mesh, self.config.shard_mode, self.config.logical_axis_rules
       )
-    return self._encode_crops_maybe_chunked(patches)
+    if crop_valid is not None:
+      patches = _select_crops(patches, crop_valid)
+    out = self._encode_crops_maybe_chunked(patches)
+    feat_pspec = PartitionSpec(_batch_mesh_spec_entry(self.config, self.mesh), None, None) if self.mesh is not None else None
+    return _finish(out, feat_pspec)
 
 
 def _few_key_attention(
@@ -618,15 +688,22 @@ def _few_key_attention(
   Returns:
     ``[..., H, D]`` in ``q.dtype``, zero on groups where all slots are ``-1``.
   """
-  scores = jnp.sum(q.astype(jnp.float32)[..., None, :, :] * k.astype(jnp.float32), axis=-1) * (q.shape[-1] ** -0.5)
+  k = k.astype(jnp.float32)
+  if valid is not None:
+    k = jnp.where(valid[..., None, None], k, 0.0)  # selection: an invalid key can not reach q's gradient either
+  scores = jnp.sum(q.astype(jnp.float32)[..., None, :, :] * k, axis=-1) * (q.shape[-1] ** -0.5)
   if valid is not None:
     # Finite fill (finfo.min) keeps softmax and its backward finite on all-(-1) padding rows.
     fmin = jnp.finfo(jnp.float32).min
     scores = jnp.where(valid[..., None], scores, fmin)
   probs = jax.nn.softmax(scores, axis=-2)
+  v = v.astype(jnp.float32)
   if valid is not None:
     probs = jnp.where(valid[..., None], probs, 0.0)
-  return jnp.sum(probs[..., None] * v.astype(jnp.float32), axis=-3).astype(q.dtype)
+    # Select the invalid keys' values too (not only multiply them by a zero prob): a non-finite value there then
+    # reaches neither the sum (0 * NaN) nor the probs' gradient (g * NaN).
+    v = jnp.where(valid[..., None, None], v, 0.0)
+  return jnp.sum(probs[..., None] * v, axis=-3).astype(q.dtype)
 
 
 class OLMo35PoolingCrossAttention(nnx.Module):

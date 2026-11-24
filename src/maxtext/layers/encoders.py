@@ -16,6 +16,7 @@
 
 import functools
 import jax
+import jax.numpy as jnp
 from flax import nnx
 from jax.sharding import Mesh
 
@@ -116,6 +117,11 @@ class VisionEncoder(nnx.Module):
 
     return encoder_name, projector_name
 
+  def _sow_olmo_probes(self, probes):
+    """log_nonfinite_probe: sows the OLMo 3.5 vision probes (per-row int32 [B]) as intermediates."""
+    for name, val in sorted(probes.items()):
+      self.sow(nnx.Intermediate, name, val)
+
   def __call__(self, input_images, input_masks=None, video_grid_thw=None, deterministic=False):
     cp_axis = getattr(self.config, "context_sharding", "context")
     cp_size = self.mesh.shape.get(cp_axis, 1) if self.mesh is not None else 1
@@ -145,16 +151,24 @@ class VisionEncoder(nnx.Module):
       _vit_bwd_fence.defvjp(_vit_bwd_fence_fwd, _vit_bwd_fence_bwd)
       graphdef, state = nnx.split(self)
 
+      probe = bool(getattr(self.config, "log_nonfinite_probe", False))
+
       @functools.partial(jax.checkpoint, prevent_cse=True)
       def _remat_olmo_vision(st_in, imgs_in, masks_in):
         st_in, imgs_in = _vit_bwd_fence(st_in, imgs_in)
         mod = nnx.merge(graphdef, st_in)
         enc = getattr(mod, mod.encoder_name)
         proj = getattr(mod, mod.projector_name)
-        feats = enc(imgs_in, deterministic=deterministic, pooled_patches_idx=masks_in)
-        return proj(feats, masks_in)
+        if not probe:
+          feats = enc(imgs_in, deterministic=deterministic, pooled_patches_idx=masks_in)
+          return proj(feats, masks_in), {}
+        feats, probes = enc(imgs_in, deterministic=deterministic, pooled_patches_idx=masks_in, return_probes=True)
+        probes.update(_olmo_connector_probes(proj, imgs_in.shape[0]))
+        return proj(feats, masks_in), probes
 
-      return _remat_olmo_vision(state, input_images, input_masks), None
+      out, probes = _remat_olmo_vision(state, input_images, input_masks)
+      self._sow_olmo_probes(probes)
+      return out, None
 
     # vision encoder output, frozen params in many cases
     encoder = getattr(self, self.encoder_name)
@@ -163,7 +177,14 @@ class VisionEncoder(nnx.Module):
           input_images, video_mask=input_masks, video_grid_thw=video_grid_thw, deterministic=deterministic
       )
     elif self.vision_encoder_block == VisionEncoderBlockType.OLMO35:
-      encoder_output = encoder(input_images, deterministic=deterministic, pooled_patches_idx=input_masks)
+      if getattr(self.config, "log_nonfinite_probe", False):
+        encoder_output, probes = encoder(
+            input_images, deterministic=deterministic, pooled_patches_idx=input_masks, return_probes=True
+        )
+        probes.update(_olmo_connector_probes(getattr(self, self.projector_name), input_images.shape[0]))
+        self._sow_olmo_probes(probes)
+      else:
+        encoder_output = encoder(input_images, deterministic=deterministic, pooled_patches_idx=input_masks)
     else:
       encoder_output = encoder(input_images, deterministic=deterministic)
     deep_feats = None
@@ -186,6 +207,13 @@ class VisionEncoder(nnx.Module):
       embeddings = projector(embeddings)
 
     return embeddings, deep_feats
+
+
+def _olmo_connector_probes(connector, b_dim):
+  """log_nonfinite_probe: non-finite entries of the connector weights (same count in every row)."""
+  from maxtext.models import olmoe3_vision  # pylint: disable=import-outside-toplevel
+
+  return {"nonfinite_probe_connector_params": jnp.broadcast_to(olmoe3_vision.params_nonfinite_count(connector), (b_dim,))}
 
 
 class MultimodalMLPProjector(nnx.Module):
