@@ -1150,6 +1150,7 @@ olmo_mm_padding_input_token_id: -1 # olmo_mm: if >= 0, replace right-padding inp
 olmo_mm_num_workers: 0 # olmo_mm: PyTorch DataLoader workers for live OLMo-core MixtureDataLoader
 olmo_mm_prefetch_batches: 0 # olmo_mm: train batches built ahead on a background thread (same batches, same order)
 olmo_mm_keep_sources: [] # olmo_mm: train only these sources of the OLMo-core config (empty: all); e.g. the text source for an images-off arm
+olmo_mm_text_replay_eos_mask: false # OLMO_MM_TEXT_NPZ_DIR: H270's replay end-token fix on prepacked text rows only (never image rows).
 olmo_mm_batch_hash_steps: 0 # olmo_mm: log OLMo-core-comparable MM-BATCH-HASH lines for train batches 1..N of every loader rank
 
 # Training loop

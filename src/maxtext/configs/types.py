@@ -3174,6 +3174,14 @@ class OlmoGrainDataset(BaseModel):
           "of a multimodal SFT: the text source names only."
       ),
   )
+  olmo_mm_text_replay_eos_mask: bool = Field(
+      False,
+      description=(
+          "OLMO_MM_TEXT_NPZ_DIR mode: H270's replay end-token fix on the prepacked TEXT rows only. The loader untrains"
+          " the final <|endoftext|> of every document that does not start with <|im_start|> (the long-context replay"
+          " documents); image rows are never changed. Off by default."
+      ),
+  )
   olmo_mm_batch_hash_steps: NonNegativeInt = Field(
       0,
       description=(

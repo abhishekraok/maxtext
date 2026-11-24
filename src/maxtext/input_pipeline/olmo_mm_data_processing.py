@@ -1831,6 +1831,34 @@ class PrepackedTextRows:
     return f["input_ids"][r], f["label_mask"][r], f["doc_lens"][r], f["path"], r
 
 
+REPLAY_EOS_ID, REPLAY_IM_START_ID = 100257, 100264  # <|endoftext|>, <|im_start|> (dolma2 / Olmo 3.5 tokenizer)
+
+
+def replay_eos_label_mask(input_ids: np.ndarray, label_mask: np.ndarray, doc_lens: np.ndarray) -> Tuple[np.ndarray, int]:
+  """H270's replay end-token fix for one prepacked TEXT row (``olmo_mm_text_replay_eos_mask``): untrain the final
+  token of every document that does not start with ``<|im_start|>`` and ends in a trained ``<|endoftext|>``.
+
+  The rows' documents are whole (``doc_lens``), so a document's last token is its real end. Chat documents start with
+  ``<|im_start|>`` and keep every target; in the C16 stream the others are the long-context replay documents
+  (allenai/olmo-post-training-ledger experiments/h270). Applied to text rows only, by the loader that reads them, so
+  image rows are never touched whatever their first token. ``label_mask`` is in token coordinates (``label_mask[i]``:
+  token ``i`` is trained). Returns the new mask and the number of targets it dropped.
+  """
+  ids = np.asarray(input_ids)
+  mask = np.asarray(label_mask).astype(bool).copy()
+  dropped, start = 0, 0
+  for n in np.asarray(doc_lens, dtype=np.int64):
+    n = int(n)
+    if n <= 0:
+      continue
+    end = start + n - 1
+    if n >= 2 and ids[start] != REPLAY_IM_START_ID and ids[end] == REPLAY_EOS_ID and mask[end]:
+      mask[end] = False
+      dropped += 1
+    start += n
+  return mask, dropped
+
+
 def prepacked_row_to_olmo_core_batch(input_ids: np.ndarray, label_mask: np.ndarray, doc_lens: np.ndarray) -> dict:
   """One prepacked row as a 1-row OLMo-core text batch (as ``sft_numpy_cache.instance_to_example`` builds one).
 
@@ -1899,6 +1927,7 @@ class _PrepackedMixedHostLoader:
       convert_kwargs: dict,
       host: int,
       hash_steps: int,
+      replay_eos_mask: bool = False,
   ):
     self._local_rows = list(local_rows)
     self._cutoff = int(cutoff)
@@ -1908,6 +1937,7 @@ class _PrepackedMixedHostLoader:
     self._convert_kwargs = dict(convert_kwargs)
     self._host = int(host)
     self._hash_steps = int(hash_steps)
+    self._replay_eos_mask = bool(replay_eos_mask)
     if schedule.rows != self._cutoff:
       raise ValueError(f"OLMO_MM_TEXT_NPZ_DIR: schedule rows {schedule.rows} != trained rows {self._cutoff}")
     self._image_loaders = {}
@@ -1926,6 +1956,8 @@ class _PrepackedMixedHostLoader:
 
   def _text_row(self, t: int) -> Tuple[dict, str]:
     ids, mask, doc_lens, path, r = self._text.row(t)
+    if self._replay_eos_mask:  # text rows only: image rows never reach this method
+      mask, _ = replay_eos_label_mask(ids, mask, doc_lens)
     batch = prepacked_row_to_olmo_core_batch(ids, mask, doc_lens)
     out = olmo_core_batch_to_maxtext_batch(batch, **self._convert_kwargs)
     return out, f"text:{t}={os.path.basename(path)}#{r}"
@@ -2076,6 +2108,7 @@ def _make_prepacked_mixed_loader(config, *, global_mesh, global_load: int, resum
       convert_kwargs=convert_kwargs,
       host=jax.process_index(),
       hash_steps=int(os.environ.get("OLMO_MM_ROW_HASH_STEPS", "-1")),
+      replay_eos_mask=bool(getattr(config, "olmo_mm_text_replay_eos_mask", False)),
   )
 
 
