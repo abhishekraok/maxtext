@@ -60,14 +60,24 @@ class OLMo35SmallMmSftConfigTest(unittest.TestCase):
   def test_schedule_and_batch(self):
     cfg = self._resolve()
     steps = cfg.learning_rate_schedule_steps
-    self.assertEqual(steps, 8076)
-    self.assertEqual(int(steps * cfg.warmup_steps_fraction), int(8076 * 0.03))  # 242
+    self.assertEqual(steps, 9632)
+    self.assertEqual(int(steps * cfg.warmup_steps_fraction), int(9632 * 0.03))  # 288
     self.assertEqual(int(steps * cfg.warmup_steps_fraction) + int(steps * cfg.wsd_decay_steps_fraction), steps)
     # 16 rows of 65,536 on 512 chips (data 4 x fsdp 4 x expert 32).
     self.assertEqual(cfg.ici_data_parallelism * cfg.ici_fsdp_parallelism * cfg.ici_expert_parallelism, 512)
     self.assertEqual(round(cfg.per_device_batch_size * 512), 16)
     self.assertTrue(cfg.scan_layers)
     self.assertTrue(cfg.use_multimodal)
+
+  def test_text_arm_schedule(self):
+    cfg = self._resolve(
+        "steps=8076",
+        "learning_rate_schedule_steps=8076",
+        "warmup_steps_fraction=0.02996532937097573",
+        "wsd_decay_steps_fraction=0.9700346706290243",
+    )
+    self.assertEqual(int(8076 * cfg.warmup_steps_fraction), 242)
+    self.assertEqual(int(8076 * cfg.warmup_steps_fraction) + int(8076 * cfg.wsd_decay_steps_fraction), 8076)
 
   def test_images_off_arm_is_the_same_config(self):
     on = self._resolve()

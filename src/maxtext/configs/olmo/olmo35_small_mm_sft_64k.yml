@@ -14,7 +14,8 @@
 
 # OLMo 3.5 Small + vision (olmo35-small-e256k8-sh2x, "A4B": 40L 7:1 KDA:FA, 256 experts top-8, 4.12B active /
 # 72.6B total; SigLIP2 25L + 2x2 attention pooling + SwiGLU connector) multimodal SFT at 64K on a v4 8x8x8
-# (512 chips, 128 hosts): 16 x 65,536 tokens a step, 8,076 steps (the Small ablation, ledger issue #1608).
+# (512 chips, 128 hosts): 16 x 65,536 tokens a step, 9,632 steps = the image arm of the Small ablation (ledger issue
+# #1608; owner decision: text-matched, the text arm trains the same 129,216 text rows in 8,076 steps on a 4x4x8).
 #
 # It combines
 #   - the model, vision tower/connector, scanned stack and EMo causal pools of the Small multimodal mid-training
@@ -30,22 +31,32 @@
 #
 # Choices to know:
 #   - scan_layers=true (as mid-training; the text recipe runs false on an unstacked copy).
-#   - EMo on, causal, with mid-training's r3 pools: 32 / 64 / 256 of 256 at 1/8, 1/8, 3/4, threshold by bisection,
-#     eval pool 256. These are also the 3K text hero's causal flags (h262-3k env.json). The 16-row text runs so
+#   - EMo on, causal, with run9's own pool scheme (midtrain-small-256k STAGE_ARGS / HERO.md, "r3"): 32 / 64 / 256
+#     of 256 at 1/8, 1/8, 3/4, threshold by bisection, min 8, eval pool 256. These are also the 3K text hero's causal flags (h262-3k env.json). The 16-row text runs so
 #     far ran EMo off; the Tiny SFT used uniform [16, 512] (OLMo-core's draw). Both arms of the ablation use this.
 #   - LR: LM 7.3e-5 (the hero's 1.8e-4 at 96 rows x sqrt(16/96)); connector 2x and ViT 0.1x of LM, the ratios of the
 #     Tiny SFT (OLMo-core olmo35_mm_sft: 2e-4 / 4e-4 / 2e-5). Mid-training ran the ViT at 0.3385x (Run 9's absolute
 #     4.4e-5 held); not carried over to SFT.
-#   - Images off (the ablation's other arm): the same config plus olmo_mm_keep_sources=[<text source name(s)>],
-#     which trains only those sources of the same OLMo-core data config. Nothing else changes.
-#   - <think>/</think> rows: if the base did not train ids 100256 / 100266, pass
-#     olmo_seed_token_rows=[[100256,14023,771,29],[100266,524,27963,29]] (applied at step 0 only, never on resume).
+#   - Data (the ablation): text = the text team's prepacked C16 stream (H263's 16 x 65,536 steps, read row by row:
+#     OLMO_MM_TEXT_NPZ_DIR=gs://ai2-olmo-dev/post-training/data/c16-small-tpu-1501/prepacked/control/steps,
+#     OLMO_MM_TEXT_ROWS=129216 as a guard); images = image-only stage-2 v1 rows (olmo_mm_config_path=
+#     olmo/olmo_mm/olmo35_small_mmsft_images_s2v1_1p55b.json, 1.55B image tokens) in OLMO_MM_IMAGE_ROWS scheduled
+#     row slots over OLMO_MM_SCHEDULE_STEPS. Images off = OLMO_MM_IMAGE_ROWS=0 (no olmo_mm_config_path): step k
+#     trains file k. This config is the text-matched image arm: OLMO_MM_IMAGE_ROWS=24896 OLMO_MM_SCHEDULE_STEPS=9632.
+#     The text arm sets steps / learning_rate_schedule_steps 8076, warmup_steps_fraction 0.02996532937097573 and
+#     wsd_decay_steps_fraction 0.9700346706290243 (int(8076 * f) = 242, decay 7,834).
+#     With an OLMo-core config that holds text and images, olmo_mm_keep_sources=[<text sources>] is the images-off switch.
+#   - The text-only arm runs on a v4 4x4x8 (128 chips) at H263's production layout: ici_data_parallelism=1
+#     ici_fsdp_parallelism=16 ici_expert_parallelism=8 per_device_batch_size=0.125 (16 trained rows of 128 loaded;
+#     8 data hosts x 2 rows) ragged_buffer_factor=4.5.
+#   - <think>/</think> rows (100256 / 100266) are untrained in the mid-training base (still at init): seeded at step 0
+#     as the mean of their pieces (never on resume), as the 14T text SFT base and the Tiny conversion did.
 #
 # Launch (every host; open-instruct scripts/tpu/maxtext/k8s/olmo35-small-mm-sft-8x8x8):
 #   python3 -m maxtext.trainers.pre_train.train src/maxtext/configs/olmo/olmo35_small_mm_sft_64k.yml \
 #     run_name=... base_output_directory=gs://... load_parameters_path=gs://.../checkpoints/<step>/items \
-#     olmo_mm_config_path=/weka/.../config.json
-# env: OLMO_MM_LOADER_WORLD=16 (one OLMo-core loader rank per trained row), OLMOE3_ENABLE_2STAGE_RS=0
+#     [olmo_mm_config_path=olmo/olmo_mm/olmo35_small_mmsft_images_s2v1_1p55b.json  (image arm)]
+# env: OLMO_MM_TEXT_NPZ_DIR / OLMO_MM_TEXT_ROWS / OLMO_MM_IMAGE_ROWS / OLMO_MM_SCHEDULE_STEPS (above), OLMOE3_ENABLE_2STAGE_RS=0
 #   OLMOE3_FAST_HOST_LOOP=1 OLMOE3_FAST_SC_DEVICE_PUT=1 TPU_MEGACORE=MEGACORE_DENSE.
 
 base_config: "base.yml"
@@ -54,7 +65,7 @@ override_model_config: true
 
 # -------------- Data (OLMo-core MixtureDataLoader in-process, one loader rank per trained row) --------------
 dataset_type: "olmo_mm"
-olmo_mm_config_path: ""   # REQUIRED: the Small SFT data config (OLMo-core config.json: C16 text + image mixture)
+olmo_mm_config_path: ""   # image arm: olmo/olmo_mm/olmo35_small_mmsft_images_s2v1_1p55b.json (text: OLMO_MM_TEXT_NPZ_DIR)
 olmo_mm_work_dir: "/tmp/olmo_mm_work"
 olmo_mm_num_workers: 16
 olmo_mm_keep_sources: []  # images-off arm: [<text source name(s) of the data config>]
@@ -199,11 +210,11 @@ olmo_embedding_lr_scale: 1.0
 olmo_vision_lr_cosine_alpha_f: -1.0  # every group on the LM's schedule
 lr_schedule_type: "wsd"
 wsd_decay_style: "linear"
-steps: 8076
-learning_rate_schedule_steps: 8076
+steps: 9632
+learning_rate_schedule_steps: 9632
 warmup_step_offset: 1
-warmup_steps_fraction: 0.02996532937097573   # 242 / 8076: int(8076 * f) = 242 = int(8076 * 0.03)
-wsd_decay_steps_fraction: 0.9700346706290243  # 1 - the above: int(8076 * f) = 7834, no stable phase
+warmup_steps_fraction: 0.029900332225913623   # 288 / 9632: int(9632 * f) = 288 = int(9632 * 0.03)
+wsd_decay_steps_fraction: 0.9700996677740864  # 1 - the above: int(9632 * f) = 9344, no stable phase
 learning_rate_final_fraction: 0.0
 adam_b1: 0.9
 adam_b2: 0.95
@@ -215,11 +226,11 @@ olmo_clip_embeddings_with_lm: true
 skip_step_on_spikes: true
 skip_step_interval: 128
 skip_step_scaling_factor: 6.0
-olmo_seed_token_rows: []        # see the header: set only if the base did not train 100256 / 100266
+olmo_seed_token_rows: [[100256, 14023, 771, 29], [100266, 524, 27963, 29]]  # step 0 only (base rows untrained)
 
 # -------------- Checkpointing & logging --------------
 enable_checkpointing: true
-checkpoint_period: 1000              # ~0.8 TB a save with optimizer state; 8 saves for the run
-max_num_checkpoints_to_keep: 30   # keep every save of the 8,076-step run (deletions stall the slice; H269)
+checkpoint_period: 1000              # ~0.8 TB a save with optimizer state; 10 saves for the run
+max_num_checkpoints_to_keep: 30   # keep every save of the run (deletions stall the slice; H269)
 async_checkpointing: false
 log_loss_parts: true
