@@ -1212,7 +1212,10 @@ def nonfinite_probe_log_lines(step, probe) -> list[str]:
 def _maybe_log_required_rbf(config, step, metrics, program):
   """log_required_ragged_buffer_factor probe: one REQUIRED_RBF line per train program run (fetches the vector)."""
   if getattr(config, "log_nonfinite_probe", False) and "nonfinite_probe" in metrics:
-    for line in nonfinite_probe_log_lines(step, jax.device_get(metrics["nonfinite_probe"])):
+    # The per-row counts are batch-sharded over every host: gather the global arrays (a collective; every process
+    # reaches this call) instead of device_get, which refuses non-addressable arrays on a multi-host slice.
+    probe = jax.tree.map(lambda x: multihost_utils.process_allgather(x, tiled=True), metrics["nonfinite_probe"])
+    for line in nonfinite_probe_log_lines(step, probe):
       max_logging.log(line)
   if not getattr(config, "log_required_ragged_buffer_factor", False) or "moe_required_rbf" not in metrics:
     return
