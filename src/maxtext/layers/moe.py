@@ -4426,6 +4426,16 @@ class RoutedMoE(nnx.Module):
     # mesh axes, so it is threaded down as an argument instead of read off the module.
     per_expert_scale = None if self.per_expert_scale is None else self.per_expert_scale[...]
 
+    if self.config.emo_enabled and self.config.emo_causal_pool and forced_routed_experts is None:
+      if input_ids is None:
+        raise ValueError("Causal EMo requires packed document segment ids.")
+      # Compute the document-prefix pool and expert IDs on the global logical
+      # batch before token sharding. Receivers consume the same selected IDs.
+      _, forced_routed_experts = self.get_topk(
+          jax.lax.stop_gradient(gate_logits), pre_bias_logits, self.rngs, input_ids,
+          per_expert_scale=per_expert_scale,
+      )
+
     in_specs = (
         input_partition_pspec,
         gate_logits_pspec,

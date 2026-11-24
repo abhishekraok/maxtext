@@ -1397,6 +1397,9 @@ class MoEGeneral(BaseModel):
   )
   emo_max_document_expert_pool: int = Field(512, description="Largest EMo training pool size (must be <= num_experts).")
   emo_eval_document_expert_pool: int = Field(512, description="Fixed EMo pool size outside training.")
+  emo_causal_pool: bool = Field(
+      False, description="Rank expert pools from each packed document's prefix through the current token."
+  )
   emo_document_expert_pool_choices: list[int] = Field(
       default_factory=list,
       description=(
