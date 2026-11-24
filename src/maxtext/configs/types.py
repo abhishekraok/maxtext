@@ -1267,6 +1267,13 @@ class MoEGeneral(BaseModel):
           " owner removes it."
       ),
   )
+  skip_guard_cap_counts_spikes: bool = Field(
+      True,
+      description=(
+          "skip_guard: count finite spike skips toward skip_guard_max_skips (true) or only non-finite skips (false)."
+          " Two consecutive skips halt the run either way."
+      ),
+  )
   skip_guard_max_skips: int = Field(
       -1,
       description="skip_guard: the most skipped steps (both kinds) a run may take; set it to 1% of the registered updates, rounded (32 at 3,211).",

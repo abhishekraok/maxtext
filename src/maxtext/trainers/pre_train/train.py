@@ -1268,7 +1268,7 @@ def skip_guard_read(x) -> dict:
   return out
 
 
-_SKIP_JOURNAL: set[int] | None = None  # skipped steps, journaled by this and earlier attempts of the run
+_SKIP_JOURNAL: dict[int, str] | None = None  # skipped step -> kind, journaled by this and earlier attempts of the run
 
 
 def skip_guard_dir(config) -> epath.Path:
@@ -1285,12 +1285,14 @@ def skip_guard_startup(config):
   if (d / "HALT").exists():
     max_logging.log(f"SKIP-GUARD-HALT {d / 'HALT'} exists: an earlier attempt halted for the owner; not training")
     sys.exit(1)
-  steps = set()
+  steps = {}
   if d.exists():
     for f in d.glob("step_*"):
-      steps.add(int(f.name.split("_")[1]))
+      _, step, kind = f.name.split("_")
+      if kind == "nonfinite" or int(step) not in steps:  # a step journaled as both kinds counts as non-finite
+        steps[int(step)] = kind
   _SKIP_JOURNAL = steps
-  max_logging.log(f"skip_guard: {len(steps)} skipped steps journaled by earlier attempts: {sorted(steps)}")
+  max_logging.log(f"skip_guard: {len(steps)} skipped steps journaled by earlier attempts: {sorted(steps.items())}")
 
 
 def _skip_guard_write(config, name, text):
@@ -1311,15 +1313,19 @@ def maybe_skip_guard(config, step, metrics):
     raise RuntimeError(f"skip_guard: step {step}'s program returned no guard vector")
   global _SKIP_JOURNAL
   if _SKIP_JOURNAL is None:
-    _SKIP_JOURNAL = set()
+    _SKIP_JOURNAL = {}
   g = skip_guard_read(metrics["skip_guard"])
+  kind = "nonfinite" if (g["image_emb_nonfinite"] or g["loss_nonfinite"] or g["grad_norm_nonfinite"]) else "spike"
+  if g["skipped"] and (kind == "nonfinite" or int(step) not in _SKIP_JOURNAL):
+    _SKIP_JOURNAL[int(step)] = kind
+  # Capped total: the skips in the restored optimizer state, or the distinct steps journaled by any attempt, if more
+  # (an attempt that died after the last save took skips the state no longer holds). Spike skips count only when
+  # skip_guard_cap_counts_spikes.
+  spikes = getattr(config, "skip_guard_cap_counts_spikes", True)
+  state_total = int(g["skips_nonfinite"] + (g["skips_spike"] if spikes else 0))
+  journal_total = sum(1 for k in _SKIP_JOURNAL.values() if spikes or k == "nonfinite")
+  total = max(state_total, journal_total)
   if g["skipped"]:
-    _SKIP_JOURNAL.add(int(step))
-  # Total: the skips in the restored optimizer state, or every distinct step journaled by any attempt, if more (an
-  # attempt that died after the last save took skips the state no longer holds).
-  total = max(int(g["skips_nonfinite"] + g["skips_spike"]), len(_SKIP_JOURNAL))
-  if g["skipped"]:
-    kind = "nonfinite" if (g["image_emb_nonfinite"] or g["loss_nonfinite"] or g["grad_norm_nonfinite"]) else "spike"
     line = (
         f"SKIP-STEP step={step} kind={kind} loss={g['loss']:.6g} raw_grad_norm={g['raw_grad_norm']:.6g}"
         f" image_emb_nonfinite={int(g['image_emb_nonfinite'])} loss_nonfinite={int(g['loss_nonfinite'])}"
@@ -1332,7 +1338,7 @@ def maybe_skip_guard(config, step, metrics):
     _skip_guard_write(config, f"step_{int(step):07d}_{kind}", line + "\n")
   reason = None
   if total > config.skip_guard_max_skips:
-    reason = f"{total} skipped steps > cap {config.skip_guard_max_skips}"
+    reason = f"{total} {'skipped' if spikes else 'non-finite skipped'} steps > cap {config.skip_guard_max_skips}"
   elif g["consecutive_skips"] >= 2:
     reason = f"{int(g['consecutive_skips'])} consecutive skipped steps"
   if reason:

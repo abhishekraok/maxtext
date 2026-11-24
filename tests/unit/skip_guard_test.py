@@ -113,7 +113,7 @@ class HostCheckTest(unittest.TestCase):
   def setUp(self):
     self._tmp = tempfile.TemporaryDirectory()
     _cfg.out = self._tmp.name
-    train._SKIP_JOURNAL = set()
+    train._SKIP_JOURNAL = {}
 
   def tearDown(self):
     self._tmp.cleanup()
@@ -131,7 +131,7 @@ class HostCheckTest(unittest.TestCase):
     train._SKIP_JOURNAL = None
     with mock.patch.object(train.max_logging, "log"):
       train.skip_guard_startup(_cfg())
-    self.assertEqual(train._SKIP_JOURNAL, {501, 601, 701})
+    self.assertEqual(train._SKIP_JOURNAL, {501: "nonfinite", 601: "spike", 701: "spike"})
     with self.assertRaises(SystemExit):  # state says 1 skip; the journal holds 4 distinct steps > cap 3
       self._run(step=801, skipped=1, skips_spike=1, consecutive_skips=1)
     self.assertTrue(os.path.exists(os.path.join(_cfg.out, "r", "skip_guard", "HALT")))
@@ -142,7 +142,7 @@ class HostCheckTest(unittest.TestCase):
   def test_replayed_skip_counted_once(self):
     self._run(step=9, skipped=1, skips_spike=1, consecutive_skips=1)
     self._run(step=9, skipped=1, skips_spike=1, consecutive_skips=1)
-    self.assertEqual(train._SKIP_JOURNAL, {9})
+    self.assertEqual(train._SKIP_JOURNAL, {9: "spike"})
 
   def test_clean_step_silent(self):
     self.assertEqual(self._run(), [])
@@ -165,6 +165,19 @@ class HostCheckTest(unittest.TestCase):
     self._run(skipped=1, skips_nonfinite=2, skips_spike=1, consecutive_skips=1)  # 3 = cap: runs on
     with self.assertRaises(SystemExit):
       self._run(skipped=1, skips_nonfinite=2, skips_spike=2, consecutive_skips=1)  # 4 > cap 3
+
+  def test_cap_without_spikes(self):
+    cfg = _cfg(skip_guard_cap_counts_spikes=False)
+    with mock.patch.object(train.max_logging, "log"):
+      for st in range(10, 20, 2):  # five spike skips, none back to back: under cap 3 when spikes do not count
+        maybe_skip_guard(cfg, st, _vec(skipped=1, skips_spike=(st - 8) // 2, consecutive_skips=1))
+      maybe_skip_guard(cfg, 30, _vec(skipped=1, loss_nonfinite=1, skips_nonfinite=3, skips_spike=5, consecutive_skips=1))
+      with self.assertRaises(SystemExit):  # 4 non-finite > 3
+        maybe_skip_guard(cfg, 40, _vec(skipped=1, loss_nonfinite=1, skips_nonfinite=4, skips_spike=5,
+                                       consecutive_skips=1))
+      train._SKIP_JOURNAL = {}
+      with self.assertRaises(SystemExit):  # back-to-back spikes still halt
+        maybe_skip_guard(cfg, 50, _vec(skipped=1, skips_spike=2, consecutive_skips=2))
 
   def test_missing_vector_fails_closed(self):
     with self.assertRaisesRegex(RuntimeError, "no guard vector"):
