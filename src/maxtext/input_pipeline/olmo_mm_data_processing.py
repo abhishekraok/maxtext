@@ -1736,6 +1736,349 @@ class _TrainedRowsHostLoader:
     return out
 
 
+# --------------------------------------------------------------------------------------------------------------------
+# Prepacked text stream + interleaved image rows (OLMO_MM_TEXT_NPZ_DIR): the Small multimodal SFT ablation.
+#
+# Text comes from a prepacked global-batch stream (``step00001.npz`` ...; H263's reader contract: ``input_ids`` and
+# target-coordinate ``label_mask`` ``[R, L]``, ``doc_lens_flat`` + ``doc_lens_offsets[R + 1]`` or JSON ``doc_lens[R]``),
+# read row by row in file order: text row ``t`` is row ``t % R`` of file ``t // R + 1``. Image sequences come from
+# OLMo-core's MixtureDataLoader over an image-only mixture (``olmo_mm_config_path``), one loader rank per trained row.
+# ``ImageSlotSchedule`` decides which trained slots hold an image sequence; every other slot takes the next text row.
+# With ``OLMO_MM_IMAGE_ROWS=0`` the run trains exactly the text stream's steps (step k = file k), so the text-only arm
+# and the image arm see the same text rows in the same order and differ only in the image slots.
+# --------------------------------------------------------------------------------------------------------------------
+
+
+class ImageSlotSchedule:
+  """Image slots of a run with ``rows`` trained rows per step, ``steps`` steps and ``image_rows`` image sequences.
+
+  Slot ``g = (step - 1) * rows + row`` (``step`` 1-based, ``row`` in ``[0, rows)``) holds an image sequence iff
+  ``floor((g + 1) N / T) > floor(g N / T)`` with ``N = image_rows``, ``T = rows * steps`` (evenly spread, exact
+  integer arithmetic). Text slot ``g`` takes text row ``g - floor(g N / T)``.
+  """
+
+  def __init__(self, rows: int, steps: int, image_rows: int):
+    self.rows, self.steps, self.image_rows = int(rows), int(steps), int(image_rows)
+    self.total = self.rows * self.steps
+    if self.rows <= 0 or self.steps <= 0 or not 0 <= self.image_rows < self.total:
+      raise ValueError(f"ImageSlotSchedule: bad rows={rows} steps={steps} image_rows={image_rows}")
+    self.text_rows = self.total - self.image_rows
+
+  def slot(self, step: int, row: int) -> int:
+    return (int(step) - 1) * self.rows + int(row)
+
+  def images_before(self, g: int) -> int:
+    return (int(g) * self.image_rows) // self.total
+
+  def is_image(self, g: int) -> bool:
+    return self.images_before(int(g) + 1) > self.images_before(g)
+
+  def text_index(self, g: int) -> int:
+    return int(g) - self.images_before(g)
+
+  def image_count_before_step(self, row: int, step: int) -> int:
+    """Image slots at ``row`` in steps ``1 .. step - 1`` (the image sequences rank ``row`` has served)."""
+    return sum(1 for s in range(1, int(step)) if self.is_image(self.slot(s, row)))
+
+
+class PrepackedTextRows:
+  """Random access to the rows of a prepacked ``step#####.npz`` stream (small LRU cache of decoded files)."""
+
+  def __init__(self, root: str, cache_files: int = 4):
+    self._root = epath.Path(root)
+    first = self._path(1)
+    if first is None:
+      raise FileNotFoundError(f"OLMO_MM_TEXT_NPZ_DIR={root}: no step00001.npz")
+    self.rows_per_file = int(self._load(1)["input_ids"].shape[0])
+    self._cache: dict[int, dict[str, Any]] = {}
+    self._order: List[int] = []
+    self._cache_files = int(cache_files)
+
+  def _path(self, step: int):
+    for name in (f"step{step:05d}.npz", f"step{step:04d}.npz"):
+      p = self._root / name
+      if p.exists():
+        return p
+    return None
+
+  def _load(self, step: int) -> dict[str, Any]:
+    path = self._path(step)
+    if path is None:
+      raise FileNotFoundError(f"OLMO_MM_TEXT_NPZ_DIR: no file for step {step} under {self._root}")
+    z = np.load(io.BytesIO(path.read_bytes()), allow_pickle=False)
+    input_ids = np.asarray(z["input_ids"])
+    n_rows = input_ids.shape[0]
+    if "doc_lens" in z.files:
+      doc_lens = [np.asarray(json.loads(str(s)), dtype=np.int64) for s in z["doc_lens"]]
+    else:
+      flat, off = np.asarray(z["doc_lens_flat"]), np.asarray(z["doc_lens_offsets"])
+      doc_lens = [flat[off[r] : off[r + 1]].astype(np.int64) for r in range(n_rows)]
+    return {"input_ids": input_ids, "label_mask": np.asarray(z["label_mask"]).astype(bool), "doc_lens": doc_lens,
+            "path": str(path)}
+
+  def file(self, step: int) -> dict[str, Any]:
+    if step not in self._cache:
+      self._cache[step] = self._load(step)
+      self._order.append(step)
+      while len(self._order) > self._cache_files:
+        self._cache.pop(self._order.pop(0), None)
+    return self._cache[step]
+
+  def row(self, t: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, int]:
+    """Text row ``t`` (0-based): ``(input_ids, label_mask, doc_lens, file path, row in file)``."""
+    step, r = divmod(int(t), self.rows_per_file)
+    f = self.file(step + 1)
+    return f["input_ids"][r], f["label_mask"][r], f["doc_lens"][r], f["path"], r
+
+
+def prepacked_row_to_olmo_core_batch(input_ids: np.ndarray, label_mask: np.ndarray, doc_lens: np.ndarray) -> dict:
+  """One prepacked row as a 1-row OLMo-core text batch (as ``sft_numpy_cache.instance_to_example`` builds one).
+
+  ``label_mask[i]``: token ``i`` is trained (predicted at ``i - 1``), so ``labels[i] = input_ids[i + 1]`` where
+  ``label_mask[i + 1]``. ``document_ids`` number the documents of ``doc_lens``; positions after them are padding
+  (``document_ids = -1``, ``router_token_mask = False``, no loss).
+  """
+  ids = np.asarray(input_ids).astype(np.int64)
+  mask = np.asarray(label_mask).astype(bool)
+  dl = np.asarray(doc_lens, dtype=np.int64)
+  dl = dl[dl > 0]
+  n = int(ids.shape[0])
+  used = int(dl.sum())
+  if used > n:
+    raise ValueError(f"prepacked row: doc_lens sum {used} > row length {n}")
+  if mask[used:].any() or (used > 0 and mask[0]):
+    raise ValueError("prepacked row: a padding position or position 0 is marked as a label")
+  labels = np.full(n, -100, dtype=np.int64)
+  labels[:-1] = np.where(mask[1:], ids[1:], -100)
+  doc = np.full(n, -1, dtype=np.int64)
+  doc[:used] = np.repeat(np.arange(len(dl), dtype=np.int64), dl)
+  rtm = np.zeros(n, dtype=bool)
+  rtm[:used] = True
+  return {
+      "input_ids": ids[None, :],
+      "labels": labels[None, :],
+      "loss_masks": (labels >= 0).astype(np.float32)[None, :],
+      "document_ids": doc[None, :],
+      "router_token_mask": rtm[None, :],
+  }
+
+
+def _maxtext_batch_hash(arrays: dict[str, np.ndarray]) -> dict[str, str]:
+  """sha256 of every key of a converted MaxText row batch; ``images`` over its used crops only (the rest are zero
+  padding whose count is fixed by the config), so image rows hash their real pixels cheaply."""
+  out: dict[str, str] = {}
+  total = hashlib.sha256()
+  for key in sorted(arrays):
+    arr = arrays[key]
+    if key == "images" and "pooled_patches_idx" in arrays:
+      pooled = arrays["pooled_patches_idx"]
+      n_patch = int(arr.shape[2]) if arr.ndim >= 3 else 1
+      used = int(pooled.max()) // n_patch + 1 if pooled.size and int(pooled.max()) >= 0 else 0
+      arr = arr[:, :used]
+    data = np.ascontiguousarray(arr).tobytes()
+    out[key] = hashlib.sha256(data).hexdigest()[:16]
+    total.update(key.encode())
+    total.update(str(arr.shape).encode())
+    total.update(data)
+  out["all"] = total.hexdigest()
+  return out
+
+
+class _PrepackedMixedHostLoader:
+  """A host's local batch: prepacked text rows and scheduled image rows in its trained slots, zeros elsewhere."""
+
+  def __init__(
+      self,
+      *,
+      local_rows: List[int],
+      cutoff: int,
+      text: PrepackedTextRows,
+      schedule: ImageSlotSchedule,
+      image_loader_for_rank,  # callable(rank, consumed) -> iterator of 1-row MaxText batches, or None
+      next_step: int,
+      convert_kwargs: dict,
+      host: int,
+      hash_steps: int,
+  ):
+    self._local_rows = list(local_rows)
+    self._cutoff = int(cutoff)
+    self._text = text
+    self._schedule = schedule
+    self._step = int(next_step)
+    self._convert_kwargs = dict(convert_kwargs)
+    self._host = int(host)
+    self._hash_steps = int(hash_steps)
+    if schedule.rows != self._cutoff:
+      raise ValueError(f"OLMO_MM_TEXT_NPZ_DIR: schedule rows {schedule.rows} != trained rows {self._cutoff}")
+    self._image_loaders = {}
+    trained = sorted({r for r in self._local_rows if r < self._cutoff})
+    if schedule.image_rows > 0:
+      if image_loader_for_rank is None:
+        raise ValueError("OLMO_MM_IMAGE_ROWS > 0 needs olmo_mm_config_path (an image-only OLMo-core mixture)")
+      for r in trained:
+        consumed = schedule.image_count_before_step(r, self._step)
+        self._image_loaders[r] = image_loader_for_rank(r, consumed)
+    self._template = None
+    self._pool = None
+
+  def __iter__(self):
+    return self
+
+  def _text_row(self, t: int) -> Tuple[dict, str]:
+    ids, mask, doc_lens, path, r = self._text.row(t)
+    batch = prepacked_row_to_olmo_core_batch(ids, mask, doc_lens)
+    out = olmo_core_batch_to_maxtext_batch(batch, **self._convert_kwargs)
+    return out, f"text:{t}={os.path.basename(path)}#{r}"
+
+  def __next__(self) -> dict[str, np.ndarray]:
+    step = self._step
+    if step > self._schedule.steps:
+      raise StopIteration
+    rows: List[Optional[dict]] = []
+    desc: List[str] = []
+    # This step's image rows are drawn from their ranks' loaders concurrently.
+    image_rows = [r for r in self._local_rows if r < self._cutoff and self._schedule.is_image(self._schedule.slot(step, r))]
+    if image_rows and self._pool is None:
+      import concurrent.futures  # pylint: disable=import-outside-toplevel
+      self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self._image_loaders)))
+    pending = {r: self._pool.submit(next, self._image_loaders[r]) for r in image_rows}
+    for row in self._local_rows:
+      if row >= self._cutoff:
+        rows.append(None)
+        continue
+      g = self._schedule.slot(step, row)
+      if row in pending:
+        arrays = pending[row].result()
+        rows.append(arrays)
+        desc.append(f"{row}:image")
+      else:
+        arrays, d = self._text_row(self._schedule.text_index(g))
+        rows.append(arrays)
+        desc.append(f"{row}:{d}")
+    template = next((r for r in rows if r is not None), None)
+    if template is None:
+      if self._template is None:
+        # A host with no trained row: one blank text row as the template.
+        self._template, _ = self._text_row(0)
+      template = self._template
+    out = {}
+    for name, ref in template.items():
+      fill = -1 if name == "pooled_patches_idx" else 0
+      arr = np.full((len(self._local_rows),) + ref.shape[1:], fill, dtype=ref.dtype)
+      for i, r in enumerate(rows):
+        if r is not None:
+          if set(r) != set(template):
+            raise ValueError("OLMO_MM_TEXT_NPZ_DIR: text and image rows have different fields")
+          arr[i] = r[name][0]
+      out[name] = arr
+    if desc:
+      line = f"SMALLMM-ROWS step={step} host={self._host} " + " ".join(desc)
+      if self._hash_steps < 0 or step <= self._hash_steps:
+        trained = [i for i, row in enumerate(self._local_rows) if row < self._cutoff]
+        hashes = _maxtext_batch_hash({k: v[trained] for k, v in out.items()})
+        line += " hash=" + json.dumps(hashes, sort_keys=True)
+      max_logging.log(line)
+    self._step += 1
+    return out
+
+
+def _make_prepacked_mixed_loader(config, *, global_mesh, global_load: int, resumed_step: int, caps: tuple):
+  """``OLMO_MM_TEXT_NPZ_DIR`` mode (see ``_PrepackedMixedHostLoader``)."""
+  n_crops, n_pooled, n_patches, patch_dim, pool_size = caps
+  text_dir = os.environ["OLMO_MM_TEXT_NPZ_DIR"].strip()
+  image_rows = int(os.environ.get("OLMO_MM_IMAGE_ROWS", "0") or 0)
+  steps = int(os.environ.get("OLMO_MM_SCHEDULE_STEPS", "0") or 0) or int(config.steps)
+  cutoff = int(config.global_batch_size_to_train_on)
+  schedule = ImageSlotSchedule(cutoff, steps, image_rows)
+  expected_text = int(os.environ.get("OLMO_MM_TEXT_ROWS", "0") or 0)
+  if expected_text and expected_text != schedule.text_rows:
+    raise ValueError(
+        f"OLMO_MM_TEXT_ROWS={expected_text} but {steps} steps x {cutoff} rows - {image_rows} image rows "
+        f"= {schedule.text_rows} text rows"
+    )
+  text = PrepackedTextRows(text_dir)
+  last_file = (schedule.text_rows - 1) // text.rows_per_file + 1
+  if text._path(last_file) is None:  # pylint: disable=protected-access
+    raise FileNotFoundError(f"OLMO_MM_TEXT_NPZ_DIR: the run needs files up to step{last_file:05d}.npz")
+  local_rows = host_loaded_global_rows(global_mesh, global_load, config.max_target_length)
+  use_loss_weights = bool(getattr(config, "olmo_use_loss_weights", False))
+  # One padding input id for text and image rows in both arms (the image mixture's train_module value, else EOS).
+  padding_input_token_id = int(getattr(config, "olmo_mm_padding_input_token_id", -1))
+  if padding_input_token_id < 0:
+    padding_input_token_id = int(os.environ.get("OLMO_MM_PADDING_INPUT_ID", "100257"))
+  convert_kwargs = dict(
+      max_target_length=int(config.max_target_length),
+      max_crops_per_seq=n_crops,
+      max_pooled_patches_per_seq=n_pooled,
+      n_patches_per_crop=n_patches,
+      patch_dim=patch_dim,
+      pool_size=pool_size,
+      dtype_mm=config.dtype_mm,
+      reset_positions_on_segment=bool(getattr(config, "olmo_reset_positions_on_segment", True)),
+      padding_input_token_id=padding_input_token_id,
+      use_loss_weights=use_loss_weights,
+      include_router_token_mask=True,
+  )
+  cfg_path = resolve_olmo_mm_config_path((getattr(config, "olmo_mm_config_path", "") or "").strip())
+  image_loader_for_rank = None
+  if image_rows > 0:
+    if not cfg_path:
+      raise ValueError("OLMO_MM_IMAGE_ROWS > 0 needs olmo_mm_config_path (an image-only OLMo-core mixture)")
+    raw = json.loads(epath.Path(cfg_path).read_text())
+    for name, src in raw["dataset"]["sources"].items():
+      if "numpy_dir" in src or "SftNumpyCache" in str(src.get("_CLASS_", "")):
+        raise ValueError(f"OLMO_MM_TEXT_NPZ_DIR: the image mixture {cfg_path} has a text source {name!r}")
+    work_dir = (getattr(config, "olmo_mm_work_dir", "") or "/tmp/olmo_mm_work").strip()
+    remap_from = getattr(config, "olmo_path_remap_from", "") or ""
+    remap_to = getattr(config, "olmo_path_remap_to", "") or ""
+    dataset = build_olmo_core_mixture_dataset(
+        cfg_path, work_dir=work_dir, path_remap_from=remap_from, path_remap_to=remap_to
+    )
+
+    def image_loader_for_rank(rank, consumed):  # pylint: disable=function-redefined
+      return _LiveMixtureHostLoader(
+          config_path=cfg_path,
+          work_dir=work_dir,
+          shard_index=rank,
+          shard_count=cutoff,
+          per_host_batch=1,
+          max_target_length=config.max_target_length,
+          max_crops_per_seq=n_crops,
+          max_pooled_patches_per_seq=n_pooled,
+          n_patches_per_crop=n_patches,
+          patch_dim=patch_dim,
+          pool_size=pool_size,
+          dtype_mm=config.dtype_mm,
+          reset_positions_on_segment=convert_kwargs["reset_positions_on_segment"],
+          padding_input_token_id=padding_input_token_id,
+          use_loss_weights=use_loss_weights,
+          path_remap_from=remap_from,
+          path_remap_to=remap_to,
+          num_workers=int(getattr(config, "olmo_mm_num_workers", 0)),
+          initial_batch_step=consumed,
+          dataset=dataset,
+          batch_hash_steps=int(getattr(config, "olmo_mm_batch_hash_steps", 0) or 0),
+      )
+
+  next_step = int(resumed_step) + int(os.environ.get("OLMO_MM_RESUME_STEP_OFFSET", "0") or 0) + 1
+  max_logging.log(
+      f"OLMo MM prepacked text + image rows: text={text_dir} ({text.rows_per_file} rows/file) image_rows={image_rows} "
+      f"steps={steps} trained rows/step={cutoff} text rows={schedule.text_rows} (files 1..{last_file}) "
+      f"images={cfg_path or '-'} host={jax.process_index()} loads global rows {local_rows} next_step={next_step}"
+  )
+  return _PrepackedMixedHostLoader(
+      local_rows=local_rows,
+      cutoff=cutoff,
+      text=text,
+      schedule=schedule,
+      image_loader_for_rank=image_loader_for_rank,
+      next_step=next_step,
+      convert_kwargs=convert_kwargs,
+      host=jax.process_index(),
+      hash_steps=int(os.environ.get("OLMO_MM_ROW_HASH_STEPS", "-1")),
+  )
+
+
 def _make_mm_loader_for_host(
     config,
     *,
@@ -1757,6 +2100,17 @@ def _make_mm_loader_for_host(
   use_loss_weights = bool(getattr(config, "olmo_use_loss_weights", False))
   resumed_step = 0 if is_eval else _detect_resumed_step(config)
   batch_hash_steps = 0 if is_eval else int(getattr(config, "olmo_mm_batch_hash_steps", 0) or 0)
+
+  if (os.environ.get("OLMO_MM_TEXT_NPZ_DIR") or "").strip() and not is_eval:
+    if global_mesh is None:
+      raise ValueError("OLMO_MM_TEXT_NPZ_DIR needs the global mesh (trained-row layout).")
+    return _make_prepacked_mixed_loader(
+        config,
+        global_mesh=global_mesh,
+        global_load=global_load,
+        resumed_step=resumed_step,
+        caps=(n_crops, n_pooled, n_patches, patch_dim, pool_size),
+    )
 
   batches_dir = (getattr(config, "olmo_mm_batches_dir", "") or "").strip()
   cfg_path = resolve_olmo_mm_config_path((getattr(config, "olmo_mm_config_path", "") or "").strip())
