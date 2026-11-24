@@ -405,6 +405,11 @@ class MultiHostDataLoadIterator:
     if os.environ.get("MAXTEXT_SFT_TAIL_MASK_ONLY") == "1":
       # Keep the exhausted host's last real inputs for routing. Zero its
       # supervised targets without changing its packed input layout.
+      rows, length = self.last_local_data["inputs"].shape
+      max_logging.log(
+          f"H251-TAIL n={getattr(self, '_batch_hash_n', 0) + 1} "
+          f"host={jax.process_index()} rows={rows} length={length}"
+      )
       return {
           **self.last_local_data,
           "targets_segmentation": np.zeros_like(self.last_local_data["targets_segmentation"]),
