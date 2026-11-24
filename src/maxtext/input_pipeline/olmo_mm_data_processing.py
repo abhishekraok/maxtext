@@ -1757,6 +1757,7 @@ class _PrepackedMixedHostLoader:
         consumed = schedule.image_count_before_step(r, self._step)
         self._image_loaders[r] = image_loader_for_rank(r, consumed)
     self._template = None
+    self._pool = None
 
   def __iter__(self):
     return self
@@ -1773,13 +1774,19 @@ class _PrepackedMixedHostLoader:
       raise StopIteration
     rows: List[Optional[dict]] = []
     desc: List[str] = []
+    # This step's image rows are drawn from their ranks' loaders concurrently.
+    image_rows = [r for r in self._local_rows if r < self._cutoff and self._schedule.is_image(self._schedule.slot(step, r))]
+    if image_rows and self._pool is None:
+      import concurrent.futures  # pylint: disable=import-outside-toplevel
+      self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self._image_loaders)))
+    pending = {r: self._pool.submit(next, self._image_loaders[r]) for r in image_rows}
     for row in self._local_rows:
       if row >= self._cutoff:
         rows.append(None)
         continue
       g = self._schedule.slot(step, row)
-      if self._schedule.is_image(g):
-        arrays = next(self._image_loaders[row])
+      if row in pending:
+        arrays = pending[row].result()
         rows.append(arrays)
         desc.append(f"{row}:image")
       else:
