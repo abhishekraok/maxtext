@@ -488,6 +488,56 @@ def register_merged_mt_lc_shim() -> None:
   sys.modules["merged_mt_lc"] = mod
 
 
+# The batch hash of allenai/OLMo-core@fd9bba1ba3f12721ae1ff3493f0b266366debec6
+# src/olmo_core/train/callbacks/batch_hash.py (``hash_batch``, used by its ``BatchHashCallback``), copied so that the
+# MM-BATCH-HASH lines of a TPU run compare one to one with a GPU run's ``rank{R}.jsonl`` records: same keys, same
+# bytes (the raw OLMo-core collator batch of one loader rank, before any MaxText conversion), same ``all`` digest.
+OLMO_CORE_BATCH_HASH_KEYS: Tuple[str, ...] = (
+    "input_ids",
+    "labels",
+    "loss_masks",
+    "example_ids",
+    "document_ids",
+    "position_ids",
+    "image_crop_counts",
+    "pooled_patches_idx",
+)
+
+
+def olmo_core_batch_hash(batch: dict[str, Any], keys: Tuple[str, ...] = OLMO_CORE_BATCH_HASH_KEYS) -> dict[str, str]:
+  """sha256 of every present (torch tensor) batch key, and of all of them together (``all``), as OLMo-core."""
+  out: dict[str, str] = {}
+  total = hashlib.sha256()
+  for key in keys:
+    value = batch.get(key)
+    # OLMo-core hashes torch tensors only; anything else is skipped there too.
+    if not (hasattr(value, "detach") and type(value).__module__.startswith("torch")):
+      continue
+    data = np.ascontiguousarray(value.detach().cpu().numpy()).tobytes()
+    out[key] = hashlib.sha256(data).hexdigest()
+    total.update(key.encode())
+    total.update(data)
+  out["all"] = total.hexdigest()
+  return out
+
+
+def maybe_log_olmo_core_batch_hash(batch: dict[str, Any], *, step: int, rank: int, max_step: int) -> Optional[dict]:
+  """olmo_mm_batch_hash_steps: one ``MM-BATCH-HASH {json}`` line for loader steps 1..max_step of one loader rank.
+
+  The JSON is OLMo-core ``BatchHashCallback``'s record (``step``, ``rank``, ``hashes``, ``index``), so a line's JSON
+  can be read exactly like a line of a GPU run's ``rank{R}.jsonl``. ``step`` counts this rank's batches from the start
+  of the run (a resumed run continues the count), as the GPU trainer's ``global_step`` does.
+  """
+  if max_step <= 0 or step > max_step:
+    return None
+  record: dict[str, Any] = {"step": int(step), "rank": int(rank), "hashes": olmo_core_batch_hash(batch)}
+  index = batch.get("index")
+  if hasattr(index, "tolist"):
+    record["index"] = index.tolist()
+  max_logging.log("MM-BATCH-HASH " + json.dumps(record))
+  return record
+
+
 def _tensor_to_numpy_mm(arr: Any, dtype_mm: Any) -> np.ndarray:
   """Convert a PyTorch or NumPy image tensor (including ``torch.bfloat16``) to ``jnp.dtype(dtype_mm)``."""
   target_dtype = jnp.dtype(dtype_mm)
@@ -1376,7 +1426,12 @@ class _LiveMixtureHostLoader:
       initial_batch_step: int = 0,
       row_slice: Optional[slice] = None,
       dataset: Any = None,
+      batch_hash_steps: int = 0,
   ):
+    # olmo_mm_batch_hash_steps: log OLMo-core batch hashes of this rank's batches 1..batch_hash_steps.
+    self._rank = int(shard_index)
+    self._batch_step = int(initial_batch_step)
+    self._batch_hash_steps = int(batch_hash_steps)
     # Rows of each rank batch this host keeps (None: all). See OLMO_MM_LOADER_WORLD in _make_mm_loader_for_host.
     self._row_slice = row_slice
     global_batch_tokens = int(per_host_batch) * int(shard_count) * int(max_target_length)
@@ -1429,6 +1484,8 @@ class _LiveMixtureHostLoader:
       self._loader.reshuffle()
       self._iter = iter(self._loader)
       raw_batch = next(self._iter)
+    self._batch_step += 1
+    maybe_log_olmo_core_batch_hash(raw_batch, step=self._batch_step, rank=self._rank, max_step=self._batch_hash_steps)
     out = olmo_core_batch_to_maxtext_batch(
         raw_batch,
         max_target_length=self._max_target_length,
@@ -1537,6 +1594,7 @@ def _make_mm_loader_for_host(
   n_crops, n_pooled, n_patches, patch_dim, pool_size = _resolve_vision_caps(config)
   use_loss_weights = bool(getattr(config, "olmo_use_loss_weights", False))
   resumed_step = 0 if is_eval else _detect_resumed_step(config)
+  batch_hash_steps = 0 if is_eval else int(getattr(config, "olmo_mm_batch_hash_steps", 0) or 0)
 
   batches_dir = (getattr(config, "olmo_mm_batches_dir", "") or "").strip()
   cfg_path = resolve_olmo_mm_config_path((getattr(config, "olmo_mm_config_path", "") or "").strip())
@@ -1613,6 +1671,7 @@ def _make_mm_loader_for_host(
             seed_offset=0x1F1F1F1F if is_eval else 0,
             initial_batch_step=resumed_step,
             dataset=dataset,
+            batch_hash_steps=batch_hash_steps,
         )
         for rank in ranks
     }
@@ -1681,6 +1740,7 @@ def _make_mm_loader_for_host(
       num_workers=int(getattr(config, "olmo_mm_num_workers", 0)),
       seed_offset=0x1F1F1F1F if is_eval else 0,
       initial_batch_step=resumed_step,
+      batch_hash_steps=batch_hash_steps,
     )
 
   if host_ranks is None:

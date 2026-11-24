@@ -3135,6 +3135,14 @@ class OlmoGrainDataset(BaseModel):
           "background thread while the current step runs. Same batches in the same order."
       ),
   )
+  olmo_mm_batch_hash_steps: NonNegativeInt = Field(
+      0,
+      description=(
+          "olmo_mm live loader: if > 0, log one 'MM-BATCH-HASH {json}' line per OLMo-core loader rank for train "
+          "batches 1..N, hashed as OLMo-core's BatchHashCallback hashes them (comparable with a GPU run's "
+          "rank{R}.jsonl)."
+      ),
+  )
 
 
 class DPO(BaseModel):
