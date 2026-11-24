@@ -27,6 +27,7 @@ from maxtext.input_pipeline import input_pipeline_utils
 from maxtext.layers import moe
 from maxtext.models import olmoe3
 from maxtext.trainers.pre_train import train
+from maxtext.utils import max_utils
 from maxtext.utils.globals import MAXTEXT_PKG_DIR
 
 
@@ -92,6 +93,26 @@ class DropProbeTest(unittest.TestCase):
 
     lines = train.required_rbf_log_lines(CfgNoDrops(), 3, np.array([1.0, 1.25], np.float32))
     self.assertEqual(lines, ["REQUIRED_RBF step=3 max=1.2500 per_layer=[1.0000,1.2500]"])
+
+
+class NonfiniteProbeTest(unittest.TestCase):
+  """log_nonfinite_probe: per-row counts and the NONFINITE lines."""
+
+  def test_row_counts_and_lines(self):
+    x = jnp.zeros((3, 4, 5)).at[1, 0, 0].set(jnp.nan).at[1, 2, 3].set(jnp.inf).at[2, 3, 4].set(-jnp.inf)
+    counts = max_utils.row_nonfinite_count(x)
+    np.testing.assert_array_equal(np.asarray(counts), [0, 2, 1])
+    probe = {
+        "decoder/nonfinite_probe_embedded": np.array([0, 2, 0]),
+        "decoder/scanned_blocks/layer_1/nonfinite_probe_layer_in": np.array([[0, 0, 0], [0, 3, 0], [0, 4, 0]]),
+    }
+    lines = train.nonfinite_probe_log_lines(5, probe)
+    self.assertEqual(lines[0], "NONFINITE step=5 decoder/nonfinite_probe_embedded total=2 rows=[0, 2, 0]")
+    self.assertEqual(
+        lines[1],
+        "NONFINITE step=5 decoder/scanned_blocks/layer_1/nonfinite_probe_layer_in total=7 rows=[0, 7, 0]"
+        " first_layer=[-1, 1, -1]",
+    )
 
 
 class LoadedRowsTest(unittest.TestCase):

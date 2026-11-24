@@ -1247,6 +1247,14 @@ class MoEGeneral(BaseModel):
           " (SFT trainer). The per-layer probe becomes [required factor, dropped rows, routed rows]."
       ),
   )
+  log_nonfinite_probe: bool = Field(
+      False,
+      description=(
+          "Diagnostic: count non-finite values per batch row at the image pixels, the image embeddings (ViT +"
+          " connector output), the merged decoder input, and every decoder layer's input and (MoE layers) router"
+          " logits, and log them as one NONFINITE line per train step, to find where a NaN enters."
+      ),
+  )
   warmup_programs_in_init: bool = Field(
       False,
       description=(

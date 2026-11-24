@@ -630,6 +630,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     aux["moe_dropless_fallback_layers"] = sum(
         (jnp.sum(jnp.asarray(x).astype(jnp.int32)) for x in fallback_flags), jnp.int32(0)
     )
+  if getattr(config, "log_nonfinite_probe", False):
+    aux["nonfinite_probe"] = nonfinite_probe_leaves(intermediate_outputs)
   if getattr(config, "log_required_ragged_buffer_factor", False):
     # Probe: per-MoE-layer minimum ragged_buffer_factor that would have avoided drops (RoutedMoE sows it next to
     # moe_has_overflow). Leaf order of collect_intermediates_by_suffix; scanned layers contribute one entry each.
@@ -1127,6 +1129,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
     metrics["has_moe_overflow"] = (
         has_moe_overflow if has_moe_overflow is not None else jnp.bool_(False)  # pyrefly: ignore[bad-assignment]
     )
+  if getattr(config, "log_nonfinite_probe", False) and "nonfinite_probe" in aux:
+    metrics["nonfinite_probe"] = aux["nonfinite_probe"]
   if getattr(config, "log_required_ragged_buffer_factor", False) and "moe_required_rbf" in aux:
     # Top-level (not "scalar"): a per-layer vector, read by training_loop_iteration for the REQUIRED_RBF line.
     metrics["moe_required_rbf"] = aux["moe_required_rbf"]
@@ -1179,8 +1183,37 @@ def eval_step(model, config, state, data, dropout_rng=None):
   return metrics
 
 
+def nonfinite_probe_leaves(intermediate_outputs) -> dict:
+  """log_nonfinite_probe: the sown per-row non-finite counts, keyed by their intermediate path ("/"-joined)."""
+  out = {}
+  for path, val in jax.tree_util.tree_leaves_with_path(intermediate_outputs):
+    keys = [str(k.key) for k in path if hasattr(k, "key")]
+    if any(k.startswith("nonfinite_probe_") for k in keys):
+      out["/".join(keys)] = val
+  return out
+
+
+def nonfinite_probe_log_lines(step, probe) -> list[str]:
+  """One NONFINITE line per probe leaf: its total and per-row counts (layer-stacked leaves: also the first layer index
+  with a non-finite value in each row, -1 if none)."""
+  lines = []
+  for name in sorted(probe):
+    v = np.asarray(probe[name]).astype(np.int64)
+    v2 = v.reshape(-1, v.shape[-1]) if v.ndim > 1 else v[None]
+    rows = v2.sum(axis=0)
+    first = [int(np.flatnonzero(v2[:, r])[0]) if rows[r] else -1 for r in range(v2.shape[1])]
+    line = f"NONFINITE step={step} {name} total={int(rows.sum())} rows={rows.tolist()}"
+    if v2.shape[0] > 1:
+      line += f" first_layer={first}"
+    lines.append(line)
+  return lines
+
+
 def _maybe_log_required_rbf(config, step, metrics, program):
   """log_required_ragged_buffer_factor probe: one REQUIRED_RBF line per train program run (fetches the vector)."""
+  if getattr(config, "log_nonfinite_probe", False) and "nonfinite_probe" in metrics:
+    for line in nonfinite_probe_log_lines(step, jax.device_get(metrics["nonfinite_probe"])):
+      max_logging.log(line)
   if not getattr(config, "log_required_ragged_buffer_factor", False) or "moe_required_rbf" not in metrics:
     return
   for line in required_rbf_log_lines(config, step, jax.device_get(metrics["moe_required_rbf"]), f" program={program}"):

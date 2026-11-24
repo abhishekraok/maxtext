@@ -1724,6 +1724,8 @@ class NNXDecoder(nnx.Module):
 
     y = self.dropout(y, deterministic=deterministic)
     y = y.astype(cfg.dtype)
+    if getattr(cfg, "log_nonfinite_probe", False):
+      self.sow(nnx.Intermediate, "nonfinite_probe_embedded", max_utils.row_nonfinite_count(y))
 
     if cfg.use_untrainable_positional_embedding:
       y += self.positional_embedding(y, decoder_positions)

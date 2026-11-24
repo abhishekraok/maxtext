@@ -36,6 +36,7 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models import olmoe3
 from maxtext.multimodal import processor as mm_processor
 from maxtext.utils import max_logging
+from maxtext.utils import max_utils
 
 # ------------------------------------------------------------------------------
 # The network: Transformer Definitions
@@ -258,6 +259,9 @@ class Transformer(nnx.Module):
       image_embeddings, deepstack_visual_embeds = self.vision_encoder(  # pyrefly: ignore[not-callable]
           input_images=encoder_images, input_masks=encoder_image_masks, deterministic=not enable_dropout
       )
+      if getattr(self.config, "log_nonfinite_probe", False):
+        self.sow(nnx.Intermediate, "nonfinite_probe_pixels", max_utils.row_nonfinite_count(encoder_images))
+        self.sow(nnx.Intermediate, "nonfinite_probe_image_emb", max_utils.row_nonfinite_count(image_embeddings))
       bidirectional_mask_image = mm_processor.get_bidirectional_mask_vision(
           self.config, decoder_input_tokens, is_video=False
       )

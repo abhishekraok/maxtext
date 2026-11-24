@@ -1473,3 +1473,9 @@ def is_eval(config) -> bool:
   eval_rules = getattr(config, "logical_axis_rules_for_eval", None)
   train_rules = getattr(config, "logical_axis_rules", None)
   return bool(eval_rules and eval_rules != train_rules and get_logical_axis_rules() == eval_rules)
+
+
+def row_nonfinite_count(x):
+  """log_nonfinite_probe: the number of non-finite (NaN / +-inf) entries of each batch row of ``x`` [B, ...], int32 [B]."""
+  bad = jnp.logical_not(jnp.isfinite(x))
+  return jnp.sum(bad, axis=tuple(range(1, x.ndim)), dtype=jnp.int32)

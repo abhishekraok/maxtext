@@ -2202,6 +2202,8 @@ class OLMoE3DecoderLayer(nnx.Module):
 
     inputs = nn.with_logical_constraint(inputs, self.activation_axis_names)
     inputs = checkpoint_name(inputs, "decoder_layer_input")
+    if getattr(self.config, "log_nonfinite_probe", False):
+      self.sow(nnx.Intermediate, "nonfinite_probe_layer_in", max_utils.row_nonfinite_count(inputs))
 
     normed = self.attn_in_norm(inputs)
     # OLMo-core trains with whole-instance mixers; the segment ids then only shape the EMo pools.
@@ -2231,6 +2233,8 @@ class OLMoE3DecoderLayer(nnx.Module):
       gate_dtype = jnp.float32 if self.config.float32_gate_logits else self.config.dtype
       router_logits, pre_bias_logits = self.moe_block.gate(ffn_in.astype(gate_dtype))
       router_logits = checkpoint_name(router_logits, "moe_router_logits")
+      if getattr(self.config, "log_nonfinite_probe", False):
+        self.sow(nnx.Intermediate, "nonfinite_probe_router", max_utils.row_nonfinite_count(router_logits))
       precomputed_gate = (router_logits, pre_bias_logits)
     if self._can_fuse_ffn_in():
       ffn_out, latent_in = self._fused_ffn_in_and_shared_ffn(ffn_in, deterministic=deterministic)
