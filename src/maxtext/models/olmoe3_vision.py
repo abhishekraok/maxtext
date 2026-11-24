@@ -454,6 +454,9 @@ class OLMo35VisionEncoder(nnx.Module):
     dev_axes = (*bt, cp_axis)
     if cp_axis in bt:
       return None
+    if int(self.mesh.shape.get("data", 1)) > 1:
+      # Validated on TPU only with data = 1 (see MaxTextConfig.validate_olmo_vit_balance_crops).
+      raise ValueError("olmo_vit_balance_crops=true needs a data mesh axis of 1; set olmo_vit_balance_crops=false.")
     m_batch = 1
     for a in bt:
       m_batch *= int(self.mesh.shape.get(a, 1))

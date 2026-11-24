@@ -5503,6 +5503,23 @@ class MaxTextConfig(
             "use moe_x_sorted=remat."
         )
 
+  def validate_olmo_vit_balance_crops(self):
+    """olmo_vit_balance_crops is validated on TPU only with a data axis of 1 (relayout over FSDP x context).
+
+    The Small mm SFT gate (v4 8x8x8, data4 x FSDP4 x EP32 on olmo35-ep-as-cp, 16 rows, 512 crops) gave NaN image
+    embeddings with it on (every image row NaN at step 0, REQUIRED_RBF at the cap) and trained finitely with it off,
+    while the same relayout is exact on CPU meshes of that structure. Refuse the untested layouts.
+    """
+    if not self.olmo_vit_balance_crops:
+      return
+    data = max(int(self.ici_data_parallelism), 1) * max(int(self.dcn_data_parallelism), 1)
+    if int(self.ici_data_parallelism) < 0 or int(self.dcn_data_parallelism) > 1 or data > 1:
+      raise ValueError(
+          "olmo_vit_balance_crops=true needs ici_data_parallelism=1 (and no DCN data parallelism): the balanced crop "
+          "relayout gave NaN image embeddings on TPU with data parallelism > 1 (Small mm SFT, data4 x FSDP4 x EP32). "
+          "Set olmo_vit_balance_crops=false."
+      )
+
   def validate_moe_quantize_token_all_gather(self):
     """Validates that moe_quantize_token_all_gather is used with supported settings."""
     if self.moe_quantize_token_all_gather:
@@ -6574,6 +6591,7 @@ class MaxTextConfig(
     self.validate_moe_topk_before_ep_all_gather()
     self.validate_moe_quantize_combine_bwd_method()
     self.validate_mllog()
+    self.validate_olmo_vit_balance_crops()
     self.validate_splash_diag_skip()
     self.validate_retry_dropless_first_steps_and_first_phase_buffer()
     if self.warmup_skip_train_dropless and not self.warmup_programs_in_init:

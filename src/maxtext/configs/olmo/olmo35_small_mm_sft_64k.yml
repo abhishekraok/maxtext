@@ -197,7 +197,7 @@ olmo_max_pooled_patches_per_seq: 65536
 olmo_vit_cp_shard_crops: true
 olmo_vit_remat_blocks: true
 olmo_vit_crop_chunk_size: 16
-olmo_vit_balance_crops: true         # crops spread over all devices, unused chunks skipped (Tiny SFT: 16.9 -> 10.3 s)
+olmo_vit_balance_crops: false        # true gave NaN image rows at step 0 on this mesh (data4; TPU gate); needs data=1
 olmo_mm_prefetch_batches: 1          # next batch built on a background thread (same batches, same order)
 olmo_mm_batch_hash_steps: 20         # MM-BATCH-HASH lines for steps 1-20 of every loader rank (the batch gate)
 

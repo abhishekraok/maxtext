@@ -38,7 +38,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 _BASE_YML = os.path.join(_REPO_ROOT, "src", "maxtext", "configs", "base.yml")
 
 
-def _cfg(balance: bool, n_crops: int, chunk: int):
+def _cfg(balance: bool, n_crops: int, chunk: int, data: int = 1, fsdp: int = 2):
   return pyconfig.initialize([
       "",
       _BASE_YML,
@@ -69,8 +69,10 @@ def _cfg(balance: bool, n_crops: int, chunk: int):
       f"olmo_max_crops_per_seq={n_crops}",
       "custom_mesh_and_rule=olmo35-ep-as-cp",
       "context_parallel_load_balance=False",
-      "ici_data_parallelism=1",
-      "ici_fsdp_parallelism=2",
+      f"ici_data_parallelism={data}",
+      f"ici_fsdp_parallelism={fsdp}",
+      "enable_checkpointing=False",
+      "skip_jax_distributed_system=True",
       "ici_expert_parallelism=4",
       "per_device_batch_size=0.5",
       "max_target_length=64",
@@ -138,6 +140,14 @@ class VitBalanceCropsTest(parameterized.TestCase):
     np.testing.assert_allclose(float(l_bal), float(l_ref), rtol=1e-6, atol=1e-6)
     for a, b in zip(jax.tree.leaves(nnx.state(g_bal)), jax.tree.leaves(nnx.state(g_ref))):
       np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-4, atol=1e-5)
+
+  def test_refuses_data_parallelism(self):
+    # Small mm SFT (data4 x FSDP4 x EP32): balanced crops gave NaN image rows on TPU; the config refuses data > 1.
+    if jax.device_count() < 8:
+      self.skipTest("needs 8 devices")
+    with self.assertRaisesRegex(ValueError, "olmo_vit_balance_crops"):
+      _cfg(True, 16, 2, data=2, fsdp=1)
+    _cfg(False, 16, 2, data=2, fsdp=1)  # balance off: fine
 
 
 if __name__ == "__main__":
