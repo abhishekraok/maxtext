@@ -1255,6 +1255,22 @@ class MoEGeneral(BaseModel):
           " logits, and log them as one NONFINITE line per train step, to find where a NaN enters."
       ),
   )
+  skip_guard: bool = Field(
+      False,
+      description=(
+          "With skip_step_on_spikes: also skip a step whose image embeddings (vision encoder + connector output, any"
+          " row) are non-finite; count skipped steps by kind (non-finite, spike) and consecutive skips in the"
+          " optimizer state, so the counts survive a restart; log a SKIP-STEP line for every skipped step; and exit 1"
+          " (SKIP-GUARD-HALT) once the skips exceed skip_guard_max_skips or two consecutive steps are skipped."
+          " Each skip is also journaled under <output>/<run_name>/skip_guard/, so a skip taken after the last save"
+          " still counts after a restart; a halt leaves a HALT marker there that stops every later start until the"
+          " owner removes it."
+      ),
+  )
+  skip_guard_max_skips: int = Field(
+      -1,
+      description="skip_guard: the most skipped steps (both kinds) a run may take; set it to 1% of the registered updates, rounded (32 at 3,211).",
+  )
   warmup_programs_in_init: bool = Field(
       False,
       description=(
@@ -5511,6 +5527,33 @@ class MaxTextConfig(
             "use moe_x_sorted=remat."
         )
 
+  def validate_skip_guard(self):
+    """skip_guard is checked on the single-mesh pre_train loop with synchronous checkpointing and no dropless replay
+    only. The abort flags must be off, since they would end the run on the very non-finite loss the guard skips."""
+    if not self.skip_guard:
+      return
+    problems = []
+    if not self.skip_step_on_spikes:
+      problems.append("skip_step_on_spikes=true")
+    if self.skip_guard_max_skips < 0:
+      problems.append("skip_guard_max_skips >= 0 (1% of the registered updates, rounded)")
+    if self.abort_on_nan_loss or self.abort_on_inf_loss:
+      problems.append("abort_on_nan_loss=false and abort_on_inf_loss=false")
+    if self.enable_diloco:
+      problems.append("enable_diloco=false (its metrics keep replica 0 only)")
+    if self.enable_checkpointing and self.async_checkpointing:
+      problems.append("async_checkpointing=false (an exit could cut short a pending save)")
+    if self.enable_emergency_checkpoint or self.enable_multi_tier_checkpointing:
+      problems.append("no emergency or multi-tier checkpointing (their managers save asynchronously)")
+    if self.moe_dropless_fallback == "step":
+      problems.append("moe_dropless_fallback other than step (a replay would hide the attempt's skip)")
+    if self.trainable_parameters_mask or self.frozen_parameters_mask or (
+        self.use_multimodal and self.freeze_vision_encoder_params
+    ):
+      problems.append("no parameter freezing (it nests the skip-step state under multi_transform)")
+    if problems:
+      raise ValueError("skip_guard needs " + "; ".join(problems))
+
   def validate_olmo_vit_balance_crops(self):
     """olmo_vit_balance_crops is validated on TPU only with a data axis of 1 (relayout over FSDP x context).
 
@@ -6600,6 +6643,7 @@ class MaxTextConfig(
     self.validate_moe_quantize_combine_bwd_method()
     self.validate_mllog()
     self.validate_olmo_vit_balance_crops()
+    self.validate_skip_guard()
     self.validate_splash_diag_skip()
     self.validate_retry_dropless_first_steps_and_first_phase_buffer()
     if self.warmup_skip_train_dropless and not self.warmup_programs_in_init:

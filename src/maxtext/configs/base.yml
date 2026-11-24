@@ -299,6 +299,8 @@ first_phase_ragged_buffer_factor: 0.0 # with moe_dropless_fallback=step and retr
 log_required_ragged_buffer_factor: false # probe: log per step and MoE layer the min ragged_buffer_factor avoiding drops (REQUIRED_RBF).
 log_moe_dropped_tokens: false # with the probe above on the all-to-all path: also count dropped/routed rows (MOE-DROPPED).
 log_nonfinite_probe: false # diagnostic: per-row non-finite counts at the image / embedding / layer inputs (NONFINITE line).
+skip_guard: false # with skip_step_on_spikes: skip non-finite image embeddings too, log SKIP-STEP, halt past skip_guard_max_skips or on 2 consecutive skips.
+skip_guard_max_skips: -1 # skip_guard: 1% of the registered updates, rounded.
 warmup_programs_in_init: false # before init_stop/run_start, run each precompiled train/eval program once on a synthetic batch (state unchanged), then a cross-host barrier.
 warmup_skip_train_dropless: false # requires warmup_programs_in_init=true; do not warm the train_dropless program (its warmup holds a second copy of the train state in HBM and can OOM). Use only when that warmup OOMs; the first dropless replay then pays the program's first load.
 log_step_diagnostics: false # append grad/param norms, max |grad|, routed-bias checksum, nonzero bias updates and the overflow flag to every training step log line

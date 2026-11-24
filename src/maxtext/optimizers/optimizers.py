@@ -199,7 +199,7 @@ def _set_schedule_counts(inner_state, count):
 
 
 def skip_step_on_spikes(
-    inner_opt: optax.GradientTransformation, interval: int, scaling_factor: float
+    inner_opt: optax.GradientTransformation, interval: int, scaling_factor: float, track_skips: bool = False
 ) -> optax.GradientTransformationExtraArgs:
   """Wrapper that skips updates when loss or grad_norm spike.
 
@@ -222,19 +222,36 @@ def skip_step_on_spikes(
     inner_opt: The inner Optax gradient transformation to wrap.
     interval: The number of recent steps to use for calculating mean and std.
     scaling_factor: The multiplier for standard deviation to set the spike threshold.
+    track_skips: (skip_guard) also keep, in the saved state, the skipped steps by kind (``skips_nonfinite``,
+      ``skips_spike``) and the current run of consecutive skips (``consecutive_skips``).
 
   Returns:
     An optax.GradientTransformationExtraArgs that skips spikes.
   """
 
   def init_fn(params):
-    return {
+    state = {
         "inner_state": inner_opt.init(params),
         "losses": jnp.zeros(interval, dtype=jnp.float32),
         "grad_norms": jnp.zeros(interval, dtype=jnp.float32),
         "count": jnp.zeros((), dtype=jnp.int32),
         "is_skipped": jnp.array(False, dtype=jnp.bool_),
     }
+    if track_skips:
+      state.update({k: jnp.zeros((), dtype=jnp.int32) for k in ("skips_nonfinite", "skips_spike", "consecutive_skips")})
+    return state
+
+  def _carry_skip_counts(state, new_state, skipped=None, nonfinite=None):
+    if not track_skips:
+      return new_state
+    if skipped is None:
+      new_state.update({k: state[k] for k in ("skips_nonfinite", "skips_spike", "consecutive_skips")})
+      return new_state
+    spike = jnp.logical_and(skipped, jnp.logical_not(nonfinite))
+    new_state["skips_nonfinite"] = state["skips_nonfinite"] + nonfinite.astype(jnp.int32)
+    new_state["skips_spike"] = state["skips_spike"] + spike.astype(jnp.int32)
+    new_state["consecutive_skips"] = jnp.where(skipped, state["consecutive_skips"] + 1, 0).astype(jnp.int32)
+    return new_state
 
   def update_fn(updates, state, params=None, **extra_args):
     # Using `pop()` removes `loss` and `grad_norm` from `extra_args` before they are
@@ -246,13 +263,13 @@ def skip_step_on_spikes(
     # Fallback to standard update if loss is not provided
     if loss is None:
       inner_updates, new_inner_state = inner_opt.update(updates, state["inner_state"], params, **extra_args)
-      return inner_updates, {
+      return inner_updates, _carry_skip_counts(state, {
           "inner_state": new_inner_state,
           "losses": state["losses"],
           "grad_norms": state["grad_norms"],
           "count": state["count"],
           "is_skipped": jnp.array(False, dtype=jnp.bool_),
-      }
+      })
 
     count = state["count"]
     losses = state["losses"]
@@ -322,6 +339,7 @@ def skip_step_on_spikes(
         "count": jnp.where(is_finite, count + 1, count),
         "is_skipped": jnp.logical_not(is_ok),
     }
+    new_state = _carry_skip_counts(state, new_state, jnp.logical_not(is_ok), jnp.logical_not(is_finite))
     return inner_updates, new_state
 
   return optax.GradientTransformationExtraArgs(init_fn, update_fn)
@@ -486,6 +504,7 @@ def get_optimizer(config, learning_rate_schedule, model=None, mesh=None):
         base_opt,
         interval=config.skip_step_interval,
         scaling_factor=config.skip_step_scaling_factor,
+        track_skips=bool(getattr(config, "skip_guard", False)),
     )
 
   # Parameter freezing: support both whitelist (`trainable_parameters_mask`) and blacklist (`frozen_parameters_mask`,

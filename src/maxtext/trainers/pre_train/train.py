@@ -20,6 +20,7 @@
 
 from typing import Any, Sequence, TypedDict
 import datetime
+import sys
 import re
 import functools
 import gc
@@ -79,6 +80,7 @@ from maxtext.input_pipeline import olmo_ppl_eval
 from maxtext.experimental.lineage import lineage_adapter
 from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
+from etils import epath
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
@@ -632,6 +634,8 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
     )
   if getattr(config, "log_nonfinite_probe", False):
     aux["nonfinite_probe"] = nonfinite_probe_leaves(intermediate_outputs)
+  if getattr(config, "skip_guard", False) and is_train:
+    aux["skip_guard_image_nonfinite"] = image_emb_nonfinite_flag(config, intermediate_outputs)
   if getattr(config, "log_required_ragged_buffer_factor", False):
     # Probe: per-MoE-layer minimum ragged_buffer_factor that would have avoided drops (RoutedMoE sows it next to
     # moe_has_overflow). Leaf order of collect_intermediates_by_suffix; scanned layers contribute one entry each.
@@ -951,7 +955,13 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if config.skip_step_on_spikes:
     # Pass pre-clip `raw_grad_norm` so spikes clamped by gradient clipping or overflowed to `inf`
     # in fp32 norm calculation are accurately detected and skipped before momentum updates.
-    state.apply_gradients(grads, loss=loss, grad_norm=raw_grad_norm)
+    skip_loss = loss
+    if getattr(config, "skip_guard", False):
+      if "skip_guard_image_nonfinite" not in aux:
+        raise ValueError("skip_guard: this model path returned no image-embedding check (unsupported adapter)")
+      # A non-finite image embedding is skipped as a non-finite step, even when it reached no loss token.
+      skip_loss = jnp.where(aux["skip_guard_image_nonfinite"] > 0, jnp.nan, loss)
+    state.apply_gradients(grads, loss=skip_loss, grad_norm=raw_grad_norm)
   else:
     state.apply_gradients(grads)
   new_state = state
@@ -1125,6 +1135,13 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "scalar": scalar_metrics,
       "scalars": {},
   }
+  if getattr(config, "skip_guard", False):
+    opt_state = nnx.to_pure_dict(nnx.state(new_state.optimizer)).get("opt_state", {})
+    if not isinstance(opt_state, dict) or "skips_nonfinite" not in opt_state:
+      raise ValueError("skip_guard: the skip-step optimizer state is not at the top of opt_state")
+    metrics["skip_guard"] = skip_guard_vector(
+        opt_state, aux["skip_guard_image_nonfinite"], loss, raw_grad_norm
+    )
   if config.moe_dropless_fallback == "step":
     metrics["has_moe_overflow"] = (
         has_moe_overflow if has_moe_overflow is not None else jnp.bool_(False)  # pyrefly: ignore[bad-assignment]
@@ -1191,6 +1208,137 @@ def nonfinite_probe_leaves(intermediate_outputs) -> dict:
     if any(k.startswith("nonfinite_probe_") for k in keys):
       out["/".join(keys)] = val
   return out
+
+
+SKIP_GUARD_FIELDS = (
+    "skipped", "image_emb_nonfinite", "loss_nonfinite", "grad_norm_nonfinite", "loss", "raw_grad_norm",
+    "skips_nonfinite", "skips_spike", "consecutive_skips",
+)
+
+
+def image_emb_nonfinite_flag(config, intermediate_outputs):
+  """skip_guard: 1 if any row's image embeddings hold a non-finite entry, else 0 (int32 scalar; an `any`, so no count
+  can wrap). Raises at trace time when the model is multimodal and no image-embedding probe was sown, so a path that
+  skips the vision encoder cannot pass silently."""
+  # Every sow at every path (a path sown twice keeps both entries), unflattened: an `any` needs no reshard.
+  leaves = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "nonfinite_probe_image_emb", ravel=False)
+  if not leaves:
+    if getattr(config, "use_multimodal", False):
+      raise ValueError("skip_guard: no nonfinite_probe_image_emb intermediate; the vision encoder did not run")
+    return jnp.int32(0)
+  bad = jnp.zeros((), jnp.bool_)
+  for v in leaves:
+    bad = jnp.logical_or(bad, jnp.any(jnp.asarray(v) != 0))
+  return bad.astype(jnp.int32)
+
+
+def skip_guard_vector(opt_state, image_flag, loss, raw_grad_norm):
+  """skip_guard: float32 [len(SKIP_GUARD_FIELDS)] for the host check, from the step's skip-step optimizer state."""
+  f32 = lambda x: jnp.asarray(x, jnp.float32)
+  return jnp.stack(
+      [
+          f32(opt_state["is_skipped"]),
+          f32(jnp.asarray(image_flag) > 0),
+          f32(jnp.logical_not(jnp.isfinite(loss))),
+          f32(jnp.logical_not(jnp.isfinite(raw_grad_norm))),
+          f32(loss),
+          f32(raw_grad_norm),
+          f32(opt_state["skips_nonfinite"]),
+          f32(opt_state["skips_spike"]),
+          f32(opt_state["consecutive_skips"]),
+      ]
+  )
+
+
+def skip_guard_read(x) -> dict:
+  """The guard vector as every process sees it (a collective; every process calls it). Flags and counts are the max
+  over every physical copy on every host, so all processes take the same decision even if replicated copies disagree;
+  loss and grad norm are reported from the first copy."""
+  n = len(SKIP_GUARD_FIELDS)
+  shards = getattr(x, "addressable_shards", None)
+  if shards:  # start every local copy's transfer before waiting on any
+    local = np.stack([np.asarray(d, np.float32).reshape(-1)[:n] for d in jax.device_get(tuple(s.data for s in shards))])
+  else:
+    local = np.asarray(x, np.float32).reshape(1, -1)[:, :n]
+  rows = np.asarray(multihost_utils.process_allgather(local)).reshape(-1, n)
+  out = {k: float(rows[0, i]) for i, k in enumerate(SKIP_GUARD_FIELDS)}
+  for i, k in enumerate(SKIP_GUARD_FIELDS):
+    if k not in ("loss", "raw_grad_norm"):
+      out[k] = float(np.max(rows[:, i]))
+  return out
+
+
+_SKIP_JOURNAL: set[int] | None = None  # skipped steps, journaled by this and earlier attempts of the run
+
+
+def skip_guard_dir(config) -> epath.Path:
+  return epath.Path(config.base_output_directory) / config.run_name / "skip_guard"
+
+
+def skip_guard_startup(config):
+  """skip_guard: before the first step, on every process. Exit 1 if an earlier attempt halted (HALT marker); otherwise
+  load the skipped steps earlier attempts journaled, so a skip taken after the last save is not lost on restart."""
+  global _SKIP_JOURNAL
+  if not getattr(config, "skip_guard", False):
+    return
+  d = skip_guard_dir(config)
+  if (d / "HALT").exists():
+    max_logging.log(f"SKIP-GUARD-HALT {d / 'HALT'} exists: an earlier attempt halted for the owner; not training")
+    sys.exit(1)
+  steps = set()
+  if d.exists():
+    for f in d.glob("step_*"):
+      steps.add(int(f.name.split("_")[1]))
+  _SKIP_JOURNAL = steps
+  max_logging.log(f"skip_guard: {len(steps)} skipped steps journaled by earlier attempts: {sorted(steps)}")
+
+
+def _skip_guard_write(config, name, text):
+  if jax.process_index() == 0:
+    d = skip_guard_dir(config)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / name).write_text(text)
+
+
+def maybe_skip_guard(config, step, metrics):
+  """skip_guard: log every skipped step and exit 1 past the skip cap or on a second consecutive skip.
+
+  Runs after the step's program, before its checkpoint save, on every process. A skipped step left weights and Adam
+  state untouched (skip_step_on_spikes), and the counts live in the optimizer state, so a restart resumes them."""
+  if not getattr(config, "skip_guard", False):
+    return
+  if "skip_guard" not in metrics:
+    raise RuntimeError(f"skip_guard: step {step}'s program returned no guard vector")
+  global _SKIP_JOURNAL
+  if _SKIP_JOURNAL is None:
+    _SKIP_JOURNAL = set()
+  g = skip_guard_read(metrics["skip_guard"])
+  if g["skipped"]:
+    _SKIP_JOURNAL.add(int(step))
+  # Total: the skips in the restored optimizer state, or every distinct step journaled by any attempt, if more (an
+  # attempt that died after the last save took skips the state no longer holds).
+  total = max(int(g["skips_nonfinite"] + g["skips_spike"]), len(_SKIP_JOURNAL))
+  if g["skipped"]:
+    kind = "nonfinite" if (g["image_emb_nonfinite"] or g["loss_nonfinite"] or g["grad_norm_nonfinite"]) else "spike"
+    line = (
+        f"SKIP-STEP step={step} kind={kind} loss={g['loss']:.6g} raw_grad_norm={g['raw_grad_norm']:.6g}"
+        f" image_emb_nonfinite={int(g['image_emb_nonfinite'])} loss_nonfinite={int(g['loss_nonfinite'])}"
+        f" grad_norm_nonfinite={int(g['grad_norm_nonfinite'])} skips_nonfinite={int(g['skips_nonfinite'])}"
+        f" skips_spike={int(g['skips_spike'])} consecutive={int(g['consecutive_skips'])} total={total}"
+        f" cap={config.skip_guard_max_skips}"
+    )
+    if jax.process_index() == 0:
+      max_logging.log(line)
+    _skip_guard_write(config, f"step_{int(step):07d}_{kind}", line + "\n")
+  reason = None
+  if total > config.skip_guard_max_skips:
+    reason = f"{total} skipped steps > cap {config.skip_guard_max_skips}"
+  elif g["consecutive_skips"] >= 2:
+    reason = f"{int(g['consecutive_skips'])} consecutive skipped steps"
+  if reason:
+    max_logging.log(f"SKIP-GUARD-HALT step={step}: {reason}; exiting for the owner")
+    _skip_guard_write(config, "HALT", f"step={step}: {reason}\n")
+    sys.exit(1)
 
 
 def nonfinite_probe_log_lines(step, probe) -> list[str]:
@@ -1410,6 +1558,7 @@ def training_loop_iteration(
             state, metrics = p_train_step_dropless(state, example_batch, *step_rng_args)
             _maybe_log_required_rbf(config, step, metrics, "dropless")
 
+  maybe_skip_guard(config, step, metrics)
   _maybe_log_loss_parts(config, step, metrics)
   step_time_delta = datetime.datetime.now() - last_step_completion
   last_step_completion = datetime.datetime.now()
@@ -1756,6 +1905,7 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
   train_utils.maybe_apply_dcn_throttling(config)
 
   start_step = get_first_step(model, state)  # this is the start_step for training
+  skip_guard_startup(config)
   train_utils.validate_completed_steps(start_step, config.steps)
   if start_step == 0 and getattr(config, "olmo_seed_token_rows", None) and not config.enable_diloco:
     seed_token_rows(state.model, config.olmo_seed_token_rows)

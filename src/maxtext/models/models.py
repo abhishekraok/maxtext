@@ -261,6 +261,7 @@ class Transformer(nnx.Module):
       )
       if getattr(self.config, "log_nonfinite_probe", False):
         self.sow(nnx.Intermediate, "nonfinite_probe_pixels", max_utils.row_nonfinite_count(encoder_images))
+      if getattr(self.config, "log_nonfinite_probe", False) or getattr(self.config, "skip_guard", False):
         self.sow(nnx.Intermediate, "nonfinite_probe_image_emb", max_utils.row_nonfinite_count(image_embeddings))
       bidirectional_mask_image = mm_processor.get_bidirectional_mask_vision(
           self.config, decoder_input_tokens, is_video=False
