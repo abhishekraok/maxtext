@@ -402,6 +402,13 @@ class MultiHostDataLoadIterator:
   def _make_padding_batch(self):
     if self.last_local_data is None:
       raise ValueError("last_local_data is None, cannot make padding batch.")
+    if os.environ.get("MAXTEXT_SFT_TAIL_MASK_ONLY") == "1":
+      # Keep the exhausted host's last real inputs for routing. Zero its
+      # supervised targets without changing its packed input layout.
+      return {
+          **self.last_local_data,
+          "targets_segmentation": jnp.zeros_like(self.last_local_data["targets_segmentation"]),
+      }
     return jtu.tree_map(lambda x: jnp.full_like(x, 0), self.last_local_data)
 
 
