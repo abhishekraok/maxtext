@@ -6549,6 +6549,18 @@ class MaxTextConfig(
             "`mtp_norm_main_hidden_state` is not supported with `mhc_expansion_rate > 1`: the MTP layers expect"
             " the expanded 4D hyper-connection state, which the decoder's final norm collapses to 3D."
         )
+    if self.olmo_mm_text_replay_eos_mask:
+      if self.mtp_num_layers > 0:
+        raise ValueError(
+            "`olmo_mm_text_replay_eos_mask` is not supported with `mtp_num_layers > 0`: the loader untrains the replay"
+            " <|endoftext|> target before the forward, which would also remove the MTP heads' later targets on it."
+            " H270's reference masks only the next-token target, after the forward."
+        )
+      if __import__("os").environ.get("MAXTEXT_LOG_DOC_CE", "") == "1":
+        raise ValueError(
+            "`olmo_mm_text_replay_eos_mask` is not supported with MAXTEXT_LOG_DOC_CE=1: the doc-CE log classifies"
+            " segments by their masked targets, so a replay document with its untrained end token would be misread."
+        )
     if self.quantize_mtp:
       if self.mtp_num_layers <= 0:
         raise ValueError("`quantize_mtp` can only be enabled when `mtp_num_layers > 0`.")

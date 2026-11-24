@@ -141,11 +141,34 @@ class LoaderTest(unittest.TestCase):
         if int(b0["inputs"][i, 0]) >= 900_000:
           image_rows += 1
           self.assertEqual(diff, 0)  # the image row's final <|endoftext|> target stays trained
+          self.assertIn("loss_weights", b0)
+          for key in ("targets", "targets_segmentation", "loss_weights"):  # and nothing else about it changes
+            np.testing.assert_array_equal(b0[key][i], b1[key][i])
           self.assertNotEqual(int(b1["targets_segmentation"][i, L - 2]), 0)
         else:
           text_drops += diff
     self.assertEqual(image_rows, 24)
     self.assertGreater(text_drops, 10)
+
+  def test_refused_with_mtp_or_doc_ce(self):
+    from maxtext.configs import pyconfig  # pylint: disable=import-outside-toplevel
+    from maxtext.utils.globals import MAXTEXT_PKG_DIR  # pylint: disable=import-outside-toplevel
+    cfg = os.path.join(MAXTEXT_PKG_DIR, "configs", "olmo", "olmo35_small_mm_sft_64k.yml")
+    args = ["", cfg, "run_name=replay_eos_refusal_test", "skip_jax_distributed_system=True"]
+    pyconfig.initialize(args + ["olmo_mm_text_replay_eos_mask=true"])  # accepted on its own
+    with self.assertRaisesRegex(ValueError, "mtp_num_layers > 0"):
+      pyconfig.initialize(args + ["olmo_mm_text_replay_eos_mask=true", "mtp_num_layers=1"])
+    old = os.environ.get("MAXTEXT_LOG_DOC_CE")
+    os.environ["MAXTEXT_LOG_DOC_CE"] = "1"
+    try:
+      with self.assertRaisesRegex(ValueError, "MAXTEXT_LOG_DOC_CE=1"):
+        pyconfig.initialize(args + ["olmo_mm_text_replay_eos_mask=true"])
+      pyconfig.initialize(args)  # the env var alone is fine with the flag off
+    finally:
+      if old is None:
+        del os.environ["MAXTEXT_LOG_DOC_CE"]
+      else:
+        os.environ["MAXTEXT_LOG_DOC_CE"] = old
 
   def test_off_by_default(self):
     self.assertIs(mm.prepacked_row_to_olmo_core_batch.__module__, mm.__name__)
