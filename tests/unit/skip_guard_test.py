@@ -113,7 +113,7 @@ class HostCheckTest(unittest.TestCase):
   def setUp(self):
     self._tmp = tempfile.TemporaryDirectory()
     _cfg.out = self._tmp.name
-    train._SKIP_JOURNAL = {}
+    train._SKIP_PRIOR, train._SKIP_THIS_ATTEMPT = {}, set()
 
   def tearDown(self):
     self._tmp.cleanup()
@@ -123,26 +123,37 @@ class HostCheckTest(unittest.TestCase):
       maybe_skip_guard(_cfg(), step, _vec(**kw))
     return [c.args[0] for c in log.call_args_list]
 
+  def _restart(self, start_step):
+    with mock.patch.object(train.max_logging, "log"):
+      train.skip_guard_startup(_cfg(), start_step)
+
   def test_journal_survives_restart_and_counts(self):
+    # save at 500 held no skips; this attempt skips 501 (non-finite), 601 and 701 (spikes), then dies
     self._run(step=501, skipped=1, loss_nonfinite=1, skips_nonfinite=1, consecutive_skips=1)
     self.assertTrue(os.path.exists(os.path.join(_cfg.out, "r", "skip_guard", "step_0000501_nonfinite")))
-    for st in (601, 701):  # restart: restored state has no skips, but the journal does
-      self._run(step=st, skipped=1, skips_spike=1, consecutive_skips=1)
-    train._SKIP_JOURNAL = None
-    with mock.patch.object(train.max_logging, "log"):
-      train.skip_guard_startup(_cfg())
-    self.assertEqual(train._SKIP_JOURNAL, {501: "nonfinite", 601: "spike", 701: "spike"})
-    with self.assertRaises(SystemExit):  # state says 1 skip; the journal holds 4 distinct steps > cap 3
-      self._run(step=801, skipped=1, skips_spike=1, consecutive_skips=1)
+    for st, n in ((601, 1), (701, 2)):
+      self._run(step=st, skipped=1, skips_nonfinite=1, skips_spike=n, consecutive_skips=1)
+    self._restart(501)  # resume after save 500: the restored state has no skips
+    self.assertEqual(train._SKIP_PRIOR, {501: "nonfinite", 601: "spike", 701: "spike"})
+    self._run(step=501)  # replay clean: 501 still counts as a lost skip (state 0 + 3 journaled = 3, at cap)
+    self._run(step=601, skipped=1, skips_spike=1, consecutive_skips=1)  # re-skipped: now in the state, not double
+    with self.assertRaises(SystemExit):  # state 2 + journaled 501, 701 = 4 > cap 3
+      self._run(step=801, skipped=1, skips_spike=2, consecutive_skips=1)
     self.assertTrue(os.path.exists(os.path.join(_cfg.out, "r", "skip_guard", "HALT")))
     with self.assertRaises(SystemExit):  # every later start stops at the marker
-      with mock.patch.object(train.max_logging, "log"):
-        train.skip_guard_startup(_cfg())
+      self._restart(1001)
 
-  def test_replayed_skip_counted_once(self):
-    self._run(step=9, skipped=1, skips_spike=1, consecutive_skips=1)
-    self._run(step=9, skipped=1, skips_spike=1, consecutive_skips=1)
-    self.assertEqual(train._SKIP_JOURNAL, {9: "spike"})
+  def test_skips_before_the_save_are_not_double_counted(self):
+    for st in (100, 200, 300):
+      self._run(step=st, skipped=1, skips_spike=1, consecutive_skips=1)
+    self._restart(501)  # state from save 500 already holds these three
+    self.assertEqual(train._SKIP_PRIOR, {})
+    self._run(step=501, skips_spike=3)  # 3 = cap: runs on
+
+  def test_journal_write_failure_still_halts(self):
+    with mock.patch.object(train.epath.Path, "write_text", side_effect=OSError("gcs down")):
+      with self.assertRaises(SystemExit):
+        self._run(skipped=1, loss_nonfinite=1, skips_nonfinite=2, consecutive_skips=2)
 
   def test_clean_step_silent(self):
     self.assertEqual(self._run(), [])
@@ -175,7 +186,7 @@ class HostCheckTest(unittest.TestCase):
       with self.assertRaises(SystemExit):  # 4 non-finite > 3
         maybe_skip_guard(cfg, 40, _vec(skipped=1, loss_nonfinite=1, skips_nonfinite=4, skips_spike=5,
                                        consecutive_skips=1))
-      train._SKIP_JOURNAL = {}
+      train._SKIP_PRIOR, train._SKIP_THIS_ATTEMPT = {}, set()
       with self.assertRaises(SystemExit):  # back-to-back spikes still halt
         maybe_skip_guard(cfg, 50, _vec(skipped=1, skips_spike=2, consecutive_skips=2))
 

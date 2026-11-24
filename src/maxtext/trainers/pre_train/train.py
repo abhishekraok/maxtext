@@ -1268,63 +1268,90 @@ def skip_guard_read(x) -> dict:
   return out
 
 
-_SKIP_JOURNAL: dict[int, str] | None = None  # skipped step -> kind, journaled by this and earlier attempts of the run
+# skip_guard host state, the same on every process: skipped steps (step -> kind) that earlier attempts journaled after
+# the save this attempt restored (they are not in the restored optimizer state), and the steps this attempt skipped.
+_SKIP_PRIOR: dict[int, str] = {}
+_SKIP_THIS_ATTEMPT: set[int] = set()
+_KINDS = ("nonfinite", "spike")
 
 
 def skip_guard_dir(config) -> epath.Path:
   return epath.Path(config.base_output_directory) / config.run_name / "skip_guard"
 
 
-def skip_guard_startup(config):
-  """skip_guard: before the first step, on every process. Exit 1 if an earlier attempt halted (HALT marker); otherwise
-  load the skipped steps earlier attempts journaled, so a skip taken after the last save is not lost on restart."""
-  global _SKIP_JOURNAL
+def skip_guard_startup(config, start_step):
+  """skip_guard: before the first step, on every process (a collective). Process 0 reads the journal and every process
+  takes its result, so hosts cannot split on a listing. Exit 1 if an earlier attempt halted (HALT marker); otherwise
+  keep the skips journaled at or after start_step: they were taken after the restored save, so its state lacks them.
+
+  The journal belongs to the output prefix: a new run needs a fresh run_name (or an empty skip_guard/ directory)."""
+  global _SKIP_PRIOR, _SKIP_THIS_ATTEMPT
+  _SKIP_PRIOR, _SKIP_THIS_ATTEMPT = {}, set()
   if not getattr(config, "skip_guard", False):
     return
   d = skip_guard_dir(config)
-  if (d / "HALT").exists():
+  halt, rows = 0, np.zeros((0, 2), np.int32)
+  if jax.process_index() == 0:
+    halt = int((d / "HALT").exists())
+    journal = {}
+    if d.exists():
+      for f in d.glob("step_*"):
+        _, step, kind = f.name.split("_")
+        if kind == "nonfinite" or int(step) not in journal:  # a step journaled as both kinds counts as non-finite
+          journal[int(step)] = kind
+    rows = np.asarray([(st, _KINDS.index(k)) for st, k in sorted(journal.items())], np.int32).reshape(-1, 2)
+  head = np.asarray(multihost_utils.broadcast_one_to_all(np.asarray([halt, len(rows)], np.int32)))
+  rows = np.asarray(multihost_utils.broadcast_one_to_all(rows if jax.process_index() == 0 else
+                                                         np.zeros((int(head[1]), 2), np.int32)))
+  if head[0]:
     max_logging.log(f"SKIP-GUARD-HALT {d / 'HALT'} exists: an earlier attempt halted for the owner; not training")
     sys.exit(1)
-  steps = {}
-  if d.exists():
-    for f in d.glob("step_*"):
-      _, step, kind = f.name.split("_")
-      if kind == "nonfinite" or int(step) not in steps:  # a step journaled as both kinds counts as non-finite
-        steps[int(step)] = kind
-  _SKIP_JOURNAL = steps
-  max_logging.log(f"skip_guard: {len(steps)} skipped steps journaled by earlier attempts: {sorted(steps.items())}")
+  _SKIP_PRIOR = {int(st): _KINDS[int(k)] for st, k in rows if int(st) >= int(start_step)}
+  max_logging.log(
+      f"skip_guard: {len(rows)} skipped steps journaled; {len(_SKIP_PRIOR)} after the restored save (step"
+      f" {int(start_step)}) count on top of its state: {sorted(_SKIP_PRIOR.items())}"
+  )
 
 
 def _skip_guard_write(config, name, text):
+  """Process 0 writes one journal file; every process then waits at a barrier, so no peer's exit can tear down
+  process 0 before the write commits. A failed write is logged and does not stop the guard's decision."""
   if jax.process_index() == 0:
-    d = skip_guard_dir(config)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / name).write_text(text)
+    try:
+      d = skip_guard_dir(config)
+      d.mkdir(parents=True, exist_ok=True)
+      (d / name).write_text(text)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      max_logging.log(f"SKIP-GUARD-JOURNAL-ERROR could not write {name}: {e!r}")
+  multihost_utils.sync_global_devices(f"skip_guard_{name}")
 
 
 def maybe_skip_guard(config, step, metrics):
   """skip_guard: log every skipped step and exit 1 past the skip cap or on a second consecutive skip.
 
   Runs after the step's program, before its checkpoint save, on every process. A skipped step left weights and Adam
-  state untouched (skip_step_on_spikes), and the counts live in the optimizer state, so a restart resumes them."""
+  state untouched (skip_step_on_spikes); the counts live in the optimizer state, and skips taken after its save by an
+  attempt that died come from the journal."""
   if not getattr(config, "skip_guard", False):
     return
   if "skip_guard" not in metrics:
     raise RuntimeError(f"skip_guard: step {step}'s program returned no guard vector")
-  global _SKIP_JOURNAL
-  if _SKIP_JOURNAL is None:
-    _SKIP_JOURNAL = {}
   g = skip_guard_read(metrics["skip_guard"])
   kind = "nonfinite" if (g["image_emb_nonfinite"] or g["loss_nonfinite"] or g["grad_norm_nonfinite"]) else "spike"
-  if g["skipped"] and (kind == "nonfinite" or int(step) not in _SKIP_JOURNAL):
-    _SKIP_JOURNAL[int(step)] = kind
-  # Capped total: the skips in the restored optimizer state, or the distinct steps journaled by any attempt, if more
-  # (an attempt that died after the last save took skips the state no longer holds). Spike skips count only when
-  # skip_guard_cap_counts_spikes.
+  if g["skipped"]:
+    _SKIP_THIS_ATTEMPT.add(int(step))
+  # Capped total: the optimizer state's count (this timeline), plus the steps an earlier attempt skipped after the
+  # restored save that this attempt has not skipped again (already in the state if it has). Spike skips count only
+  # when skip_guard_cap_counts_spikes.
   spikes = getattr(config, "skip_guard_cap_counts_spikes", True)
   state_total = int(g["skips_nonfinite"] + (g["skips_spike"] if spikes else 0))
-  journal_total = sum(1 for k in _SKIP_JOURNAL.values() if spikes or k == "nonfinite")
-  total = max(state_total, journal_total)
+  lost = sum(1 for st, k in _SKIP_PRIOR.items() if st not in _SKIP_THIS_ATTEMPT and (spikes or k == "nonfinite"))
+  total = state_total + lost
+  reason = None
+  if total > config.skip_guard_max_skips:
+    reason = f"{total} {'skipped' if spikes else 'non-finite skipped'} steps > cap {config.skip_guard_max_skips}"
+  elif g["consecutive_skips"] >= 2:
+    reason = f"{int(g['consecutive_skips'])} consecutive skipped steps"
   if g["skipped"]:
     line = (
         f"SKIP-STEP step={step} kind={kind} loss={g['loss']:.6g} raw_grad_norm={g['raw_grad_norm']:.6g}"
@@ -1335,15 +1362,12 @@ def maybe_skip_guard(config, step, metrics):
     )
     if jax.process_index() == 0:
       max_logging.log(line)
-    _skip_guard_write(config, f"step_{int(step):07d}_{kind}", line + "\n")
-  reason = None
-  if total > config.skip_guard_max_skips:
-    reason = f"{total} {'skipped' if spikes else 'non-finite skipped'} steps > cap {config.skip_guard_max_skips}"
-  elif g["consecutive_skips"] >= 2:
-    reason = f"{int(g['consecutive_skips'])} consecutive skipped steps"
-  if reason:
+  if reason:  # HALT first, so a failed journal write cannot keep the marker from being written
     max_logging.log(f"SKIP-GUARD-HALT step={step}: {reason}; exiting for the owner")
     _skip_guard_write(config, "HALT", f"step={step}: {reason}\n")
+  if g["skipped"]:
+    _skip_guard_write(config, f"step_{int(step):07d}_{kind}", line + "\n")
+  if reason:
     sys.exit(1)
 
 
@@ -1911,7 +1935,7 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
   train_utils.maybe_apply_dcn_throttling(config)
 
   start_step = get_first_step(model, state)  # this is the start_step for training
-  skip_guard_startup(config)
+  skip_guard_startup(config, start_step)
   train_utils.validate_completed_steps(start_step, config.steps)
   if start_step == 0 and getattr(config, "olmo_seed_token_rows", None) and not config.enable_diloco:
     seed_token_rows(state.model, config.olmo_seed_token_rows)
