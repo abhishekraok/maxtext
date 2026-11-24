@@ -225,8 +225,11 @@ class VitPaddingNonfiniteTest(parameterized.TestCase):
             "nonfinite_probe_connector_params",
             "nonfinite_probe_pixels_out_of_range",
             "nonfinite_probe_vit_feats",
+            "nonfinite_probe_vit_feats_blocks",
             "nonfinite_probe_vit_feats_valid",
+            "nonfinite_probe_vit_layer_blocks",
             "nonfinite_probe_vit_params",
+            "nonfinite_probe_vit_wused_blocks",
         ],
     )
     pad = np.array([_CROPS - n for n in _USED])

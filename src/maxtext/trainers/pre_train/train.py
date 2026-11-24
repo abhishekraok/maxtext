@@ -1193,12 +1193,37 @@ def nonfinite_probe_leaves(intermediate_outputs) -> dict:
   return out
 
 
+_NONFINITE_MAX_CELLS = 64
+
+
+def _nonfinite_block_line(step, name, v) -> str:
+  """``*_blocks`` leaves: ``[B, K]`` (rows x CP ranks) printed as a 2-D list; ``[L, B, K]`` (stage x rows x CP ranks)
+  as per-stage totals plus the first ``_NONFINITE_MAX_CELLS`` nonzero ``[stage, row, rank, count]`` cells in
+  (stage, row, rank) order."""
+  head = f"NONFINITE step={step} {name} total={int(v.sum())} shape={list(v.shape)}"
+  if v.ndim == 2:
+    return f"{head} rows_x_ranks={v.tolist()}"
+  v3 = v.reshape((-1,) + v.shape[-2:])
+  per_stage = v3.reshape(v3.shape[0], -1).sum(axis=1)
+  nz = np.argwhere(v3 != 0)
+  stages = np.flatnonzero(per_stage)
+  cells = [[int(l), int(r), int(k), int(v3[l, r, k])] for l, r, k in nz[:_NONFINITE_MAX_CELLS]]
+  return (
+      f"{head} first_stage={int(stages[0]) if stages.size else -1} per_stage={per_stage.tolist()} "
+      f"nonzero_cells={len(nz)} cells(stage,row,rank,count)={cells}"
+  )
+
+
 def nonfinite_probe_log_lines(step, probe) -> list[str]:
   """One NONFINITE line per probe leaf: its total and per-row counts (layer-stacked leaves: also the first layer index
-  with a non-finite value in each row, -1 if none)."""
+  with a non-finite value in each row, -1 if none). Leaves named ``*_blocks`` are per (row, CP rank) grids, see
+  ``_nonfinite_block_line``."""
   lines = []
   for name in sorted(probe):
     v = np.asarray(probe[name]).astype(np.int64)
+    if name.endswith("_blocks") and v.ndim >= 2:
+      lines.append(_nonfinite_block_line(step, name, v))
+      continue
     v2 = v.reshape(-1, v.shape[-1]) if v.ndim > 1 else v[None]
     rows = v2.sum(axis=0)
     first = [int(np.flatnonzero(v2[:, r])[0]) if rows[r] else -1 for r in range(v2.shape[1])]
@@ -1206,6 +1231,52 @@ def nonfinite_probe_log_lines(step, probe) -> list[str]:
     if v2.shape[0] > 1:
       line += f" first_layer={first}"
     lines.append(line)
+  return lines
+
+
+def mesh_device_log_lines(config, mesh) -> list[str]:
+  """log_nonfinite_probe: one ``MESH-DEVICE`` line per mesh position (non-trivial axes only) and one ``MESH-BLOCK`` line
+  per (batch shard, CP rank) of the per-(row, CP rank) ``*_blocks`` probes, naming the device(s) that hold it."""
+  from maxtext.models import olmoe3_vision  # pylint: disable=import-outside-toplevel
+
+  names = [a for a in mesh.axis_names if mesh.shape[a] > 1]
+  axis_pos = {a: i for i, a in enumerate(mesh.axis_names)}
+
+  def _dev(d):
+    coords = getattr(d, "coords", None)
+    core = getattr(d, "core_on_chip", None)
+    return d.id, d.process_index, ("(" + ",".join(str(c) for c in coords) + ")" if coords is not None else None), core
+
+  lines = [f"MESH-AXES {', '.join(f'{a}={mesh.shape[a]}' for a in mesh.axis_names)}"]
+  devs = np.asarray(mesh.devices)
+  for idx in np.ndindex(devs.shape):
+    did, proc, coords, core = _dev(devs[idx])
+    lines.append(
+        f"MESH-DEVICE axes=({','.join(names)}) idx=({','.join(str(idx[axis_pos[a]]) for a in names)}) "
+        f"id={did} proc={proc} coords={coords} core={core}"
+    )
+  batch = olmoe3_vision._batch_mesh_spec_entry(config, mesh)  # pylint: disable=protected-access
+  batch_axes = tuple(batch) if isinstance(batch, (tuple, list)) else ((batch,) if batch else ())
+  cp_axis = config.context_sharding
+  cp_size = int(mesh.shape.get(cp_axis, 1))
+  n_bs = int(np.prod([mesh.shape[a] for a in batch_axes])) if batch_axes else 1
+  rows = int(config.global_batch_size_to_train_on)
+  per = rows // n_bs if n_bs and rows % n_bs == 0 else None
+  lines.append(
+      f"MESH-BLOCK-SPEC batch_axes={batch_axes} (shard index major-to-minor) cp_axis={cp_axis} cp_size={cp_size} "
+      f"batch_shards={n_bs} rows={rows} rows_per_shard={per}"
+  )
+  blocks: dict = {}
+  for idx in np.ndindex(devs.shape):
+    bs = 0
+    for a in batch_axes:
+      bs = bs * mesh.shape[a] + idx[axis_pos[a]]
+    k = idx[axis_pos[cp_axis]] if cp_axis in axis_pos and cp_axis not in batch_axes else 0
+    blocks.setdefault((bs, k), []).append(devs[idx])
+  for (bs, k), ds in sorted(blocks.items()):
+    row_s = f"{bs * per}-{(bs + 1) * per - 1}" if per else "?"
+    desc = " ".join(f"id={did}/proc={proc}/coords={coords}/core={core}" for did, proc, coords, core in map(_dev, ds))
+    lines.append(f"MESH-BLOCK batch_shard={bs} rows={row_s} cp_rank={k} devices=[{desc}]")
   return lines
 
 
@@ -1750,6 +1821,10 @@ def train_loop(config, recorder, state=None, elastic_retry_cache=None):
       eval_data_iterator,
       state,
   ) = train_utils.setup_train_loop(config, recorder, elastic_retry_cache=elastic_retry_cache)
+
+  if getattr(config, "log_nonfinite_probe", False) and jax.process_index() == 0:
+    for line in mesh_device_log_lines(config, mesh):
+      max_logging.log(line)
 
   # Throttling is applied only if configured (dcn_bandwidth_limit is set).
   # The default flag value is empty, meaning no throttling is applied by default.

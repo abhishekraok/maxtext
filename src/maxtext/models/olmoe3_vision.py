@@ -33,6 +33,7 @@ Implements the exact vision stack from ``allenai/OLMo-core`` (#916):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from typing import Any
 
@@ -93,6 +94,39 @@ def _batch_mesh_spec_entry(config: Config, mesh: Mesh | None):
   return spec.partitions[0]
 
 
+# log_nonfinite_probe (trace-time state): while a ViT stage is traced inside ``_vit_layer_scope``, every weight is passed
+# through ``_vit_weight_as_used`` (identity; a test hook) and, if probing, its non-finite count is appended to
+# ``_WEIGHT_PROBE``. The counts are taken on the weights as consumed (after the explicit all-gather to ``P()``).
+_WEIGHT_PROBE: list | None = None
+_PROBE_LAYER: int = -1
+
+
+def _vit_weight_as_used(w: jax.Array, layer: int) -> jax.Array:  # pylint: disable=unused-argument
+  """Identity; unit tests patch it to corrupt the weights of one ViT stage as used (``layer``: 0 = patch/pos embed,
+  ``i + 1`` = block ``i``; -1 outside the ViT stages, e.g. the connector)."""
+  return w
+
+
+def _use_weight(w: jax.Array) -> jax.Array:
+  w = _vit_weight_as_used(w, _PROBE_LAYER)
+  if _WEIGHT_PROBE is not None:
+    _WEIGHT_PROBE.append(jnp.sum(jnp.logical_not(jnp.isfinite(w)), dtype=jnp.int32))
+  return w
+
+
+@contextlib.contextmanager
+def _vit_layer_scope(layer: int, probe: bool):
+  """Traces one ViT stage: sets the stage index for the weight hook and (``probe``) collects as-used weight counts."""
+  global _WEIGHT_PROBE, _PROBE_LAYER  # pylint: disable=global-statement
+  prev = (_WEIGHT_PROBE, _PROBE_LAYER)
+  collected: list = []
+  _WEIGHT_PROBE, _PROBE_LAYER = (collected if probe else None), layer
+  try:
+    yield collected
+  finally:
+    _WEIGHT_PROBE, _PROBE_LAYER = prev
+
+
 class _ViTDense(linears.DenseGeneral):
   """``DenseGeneral`` that explicitly FSDP-gathers sharded ViT/Connector weights to ``P()`` before ``dot_general``.
 
@@ -106,11 +140,11 @@ class _ViTDense(linears.DenseGeneral):
     x = jnp.asarray(inputs, self.dtype)
     k = jnp.asarray(self.kernel[...], self.dtype)
     rep = NamedSharding(self.mesh, PartitionSpec())
-    k = jax.lax.with_sharding_constraint(k, rep)
+    k = _use_weight(jax.lax.with_sharding_constraint(k, rep))
     prec = jax.lax.Precision(self.matmul_precision)
     y = jax.lax.dot_general(x, k, (((x.ndim - 1,), (0,)), ((), ())), precision=prec)
     if self.bias is not None:
-      b = jax.lax.with_sharding_constraint(jnp.asarray(self.bias[...], self.dtype), rep)
+      b = _use_weight(jax.lax.with_sharding_constraint(jnp.asarray(self.bias[...], self.dtype), rep))
       y = y + b
     return y
 
@@ -171,7 +205,7 @@ class _ViTLayerNorm(nnx.Module):
     mean = jnp.mean(x_f, axis=-1, keepdims=True)
     var = jnp.mean(jnp.square(x_f - mean), axis=-1, keepdims=True)
     normed = (x_f - mean) * jax.lax.rsqrt(var + self.eps)
-    out = normed * self.scale[...].astype(jnp.float32) + self.bias[...].astype(jnp.float32)
+    out = normed * _use_weight(self.scale[...].astype(jnp.float32)) + _use_weight(self.bias[...].astype(jnp.float32))
     return out.astype(self.dtype)
 
 
@@ -375,12 +409,35 @@ class OLMo35VisionEncoder(nnx.Module):
     for i in range(self.num_layers):
       setattr(self, f"blocks_{i}", OLMo35ViTBlock(config, mesh, rngs=rngs))
 
-  def _encode_flat_crops(self, crops: jax.Array, act_pspec: PartitionSpec | None = None) -> jax.Array:
-    """Encodes ``[..., M, num_patches, patch_pixels]`` into ``[..., M, num_patches, len(feature_layers) * embed_dim]``."""
-    x = self.patch_embedding(crops.astype(self.dtype))
-    x = x + self.positional_embedding[...].astype(self.dtype)
-    if act_pspec is not None and self.mesh is not None:
+  def _encode_flat_crops(self, crops: jax.Array, act_pspec: PartitionSpec | None = None, probe: bool = False):
+    """Encodes ``[..., M, num_patches, patch_pixels]`` into ``[..., M, num_patches, len(feature_layers) * embed_dim]``.
+
+    ``probe`` (log_nonfinite_probe): also returns ``{"layers": c, "wused": w}``, int32 ``[num_layers + 1, ..., M]`` per
+    crop: ``c[0]`` non-finite entries of the ViT input (patch embedding + positional embedding), ``c[i + 1]`` of block
+    ``i``'s output; ``w[0]`` / ``w[i + 1]`` the non-finite entries of the patch/pos-embedding / block ``i`` weights as
+    consumed on the device holding that crop (after the all-gather), broadcast over its crops.
+    """
+    lead = crops.shape[:-2]
+    use_mesh = act_pspec is not None and self.mesh is not None
+    probe_pspec = PartitionSpec(*tuple(act_pspec)[: len(lead)]) if use_mesh else None
+
+    def _place(a):
+      return sharding.maybe_shard_with_pspec(a, probe_pspec, self.mesh, self.config.shard_mode) if use_mesh else a
+
+    def _crop_count(a):
+      return _place(jnp.sum(jnp.logical_not(jnp.isfinite(a)), axis=(-2, -1), dtype=jnp.int32))
+
+    def _weight_count(collected):
+      total = functools.reduce(lambda u, v: u + v, collected, jnp.zeros((), jnp.int32))
+      return _place(jnp.broadcast_to(total, lead))
+
+    with _vit_layer_scope(0, probe) as w_embed:
+      x = self.patch_embedding(crops.astype(self.dtype))
+      x = x + _use_weight(self.positional_embedding[...].astype(self.dtype))
+    if use_mesh:
       x = sharding.maybe_shard_with_pspec(x, act_pspec, self.mesh, self.config.shard_mode)
+    layer_counts = [_crop_count(x)] if probe else []
+    w_counts = [_weight_count(w_embed)] if probe else []
     remat = bool(self.config.olmo_vit_remat_blocks)
     wanted = set(self.feature_layers)
     saved: dict[int, jax.Array] = {}
@@ -389,24 +446,43 @@ class OLMo35VisionEncoder(nnx.Module):
       if remat:
         graphdef, state = nnx.split(block)
 
-        def _run_block(st, inp, gd=graphdef):
+        def _run_block(st, inp, gd=graphdef, li=i + 1):
           mod = nnx.merge(gd, st)
-          out_b = mod(inp)
-          if act_pspec is not None and self.mesh is not None:
+          with _vit_layer_scope(li, probe) as w_blk:
+            out_b = mod(inp)
+          if use_mesh:
             out_b = sharding.maybe_shard_with_pspec(out_b, act_pspec, self.mesh, self.config.shard_mode)
+          if probe:
+            return out_b, (_crop_count(out_b), _weight_count(w_blk))
           return out_b
 
-        x = jax.checkpoint(_run_block, prevent_cse=True)(state, x)
+        res = jax.checkpoint(_run_block, prevent_cse=True)(state, x)
+        if probe:
+          x, (c_i, w_i) = res
+          layer_counts.append(c_i)
+          w_counts.append(w_i)
+        else:
+          x = res
       else:
-        x = block(x)
-        if act_pspec is not None and self.mesh is not None:
+        with _vit_layer_scope(i + 1, probe) as w_blk:
+          x = block(x)
+        if use_mesh:
           x = sharding.maybe_shard_with_pspec(x, act_pspec, self.mesh, self.config.shard_mode)
+        if probe:
+          layer_counts.append(_crop_count(x))
+          w_counts.append(_weight_count(w_blk))
       if i in wanted:
         saved[i] = x
-    return jnp.concatenate([saved[i] for i in self.feature_layers], axis=-1)
+    feats = jnp.concatenate([saved[i] for i in self.feature_layers], axis=-1)
+    if probe:
+      return feats, {"layers": jnp.stack(layer_counts), "wused": jnp.stack(w_counts)}
+    return feats
 
-  def _encode_crops_maybe_chunked(self, crops: jax.Array, *, cp_sharded: bool = False) -> jax.Array:
-    """Encodes ``[B, N_crops, P, D_in]`` while preserving batch (and optional CP) sharding across scan."""
+  def _encode_crops_maybe_chunked(self, crops: jax.Array, *, cp_sharded: bool = False, probe: bool = False):
+    """Encodes ``[B, N_crops, P, D_in]`` while preserving batch (and optional CP) sharding across scan.
+
+    ``probe``: also returns ``_encode_flat_crops``'s per-crop probes mapped back to ``[num_layers + 1, B, N_crops]``.
+    """
     b_dim, n_crops, p, d_in = crops.shape
     chunk = int(self.config.olmo_vit_crop_chunk_size)
     batch_axes = _batch_mesh_spec_entry(self.config, self.mesh)
@@ -434,11 +510,15 @@ class OLMo35VisionEncoder(nnx.Module):
           crop_chunk = sharding.maybe_shard_with_pspec(
               crop_chunk, chunk_pspec, self.mesh, self.config.shard_mode
           )
-          return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec)  # pylint: disable=protected-access
+          return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec, probe=probe)  # pylint: disable=protected-access
 
         chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
         scan_fn_cp = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body_cp) if chunk_remat else _scan_body_cp
         _, out_chunks = jax.lax.scan(scan_fn_cp, state, chunked)
+        if probe:
+          out_chunks, pr = out_chunks
+          # [n_chunks, L + 1, B, cp, chunk] -> [L + 1, B, cp, n_chunks, chunk]: crop = rank * per_rank + c * chunk + j.
+          pr = {k: jnp.transpose(v, (1, 2, 3, 0, 4)).reshape(v.shape[1], b_dim, n_crops) for k, v in pr.items()}
         out = jnp.transpose(out_chunks, (1, 2, 0, 3, 4, 5)).reshape(b_dim, n_crops * p, -1)
       else:
         # Chunk along axis 1 (n_crops) and place n_chunks at axis 0 for scan so axis 1 (B)
@@ -448,11 +528,15 @@ class OLMo35VisionEncoder(nnx.Module):
 
         def _scan_body(carry, crop_chunk):
           mod = nnx.merge(graphdef, carry)
-          return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec)  # pylint: disable=protected-access
+          return carry, mod._encode_flat_crops(crop_chunk, act_pspec=chunk_pspec, probe=probe)  # pylint: disable=protected-access
 
         chunk_remat = remat and bool(getattr(self.config, "olmo_vit_chunk_remat", True))
         scan_fn = functools.partial(jax.checkpoint, prevent_cse=False)(_scan_body) if chunk_remat else _scan_body
         _, out_chunks = jax.lax.scan(scan_fn, state, chunked)
+        if probe:
+          out_chunks, pr = out_chunks
+          # [n_chunks, L + 1, B, chunk] -> [L + 1, B, n_chunks, chunk].
+          pr = {k: jnp.transpose(v, (1, 2, 0, 3)).reshape(v.shape[1], b_dim, n_crops) for k, v in pr.items()}
         out = jnp.swapaxes(out_chunks, 0, 1).reshape(b_dim, n_crops * p, -1)
     else:
       flat_pspec = (
@@ -460,8 +544,11 @@ class OLMo35VisionEncoder(nnx.Module):
           if self.mesh is not None
           else None
       )
-      out = self._encode_flat_crops(crops, act_pspec=flat_pspec).reshape(b_dim, n_crops * p, -1)
-    return out
+      out = self._encode_flat_crops(crops, act_pspec=flat_pspec, probe=probe)
+      if probe:
+        out, pr = out
+      out = out.reshape(b_dim, n_crops * p, -1)
+    return (out, pr) if probe else out
 
   def _encode_balanced(self, patches: jax.Array, pooled_patches_idx: jax.Array) -> jax.Array | None:
     """Encodes ``[B, N_crops, P, D_in]`` spreading the crops over all devices and skipping unused crop chunks.
@@ -595,7 +682,14 @@ class OLMo35VisionEncoder(nnx.Module):
     before the ViT (so their activations, which enter the ViT weight gradients, are finite whatever the pixel buffer
     holds) and their features after it. Valid crops are unchanged.
 
-    ``return_probes``: also returns a dict of per-row int32 [B] counts (``log_nonfinite_probe``).
+    ``return_probes``: also returns a dict of per-row int32 [B] counts (``log_nonfinite_probe``), plus per crop block
+    (``K`` = size of the context mesh axis; block ``k`` = crops ``[k * N / K, (k + 1) * N / K)``, the crops CP rank
+    ``k`` encodes on the CP-sharded path):
+      ``nonfinite_probe_vit_feats_blocks`` ``[B, K]``: non-finite ViT output entries (all crops, before the mask);
+      ``nonfinite_probe_vit_layer_blocks`` ``[L + 1, B, K]``: index 0 = ViT input (patch + pos embedding), ``i + 1`` =
+        output of block ``i`` (not on the balanced path);
+      ``nonfinite_probe_vit_wused_blocks`` ``[L + 1, B, K]``: non-finite entries of that stage's weights as consumed
+        (after the all-gather) on the device(s) encoding the block (max over the block's crops / chunks).
     """
     del deterministic
     if input_images.ndim == 5:
@@ -610,6 +704,18 @@ class OLMo35VisionEncoder(nnx.Module):
     b_dim, n_crops, p = patches.shape[0], patches.shape[1], patches.shape[2]
     crop_valid = None if pooled_patches_idx is None else olmo35_crop_valid(pooled_patches_idx, n_crops, p)
     probes = {}
+    cp_axis = self.config.context_sharding
+    cp_size = self.mesh.shape.get(cp_axis, 1) if self.mesh is not None else 1
+    k_blocks = cp_size if n_crops % cp_size == 0 else 1
+
+    def _blocks(per_crop, reduce):  # [..., B, N_crops] -> [..., B, K]
+      return reduce(per_crop.reshape(per_crop.shape[:-1] + (k_blocks, n_crops // k_blocks)), axis=-1)
+
+    def _layer_probes(pr):
+      if return_probes and pr is not None:
+        probes["nonfinite_probe_vit_layer_blocks"] = _blocks(pr["layers"], jnp.sum)
+        probes["nonfinite_probe_vit_wused_blocks"] = _blocks(pr["wused"], jnp.max)
+
     if return_probes:
       probes["nonfinite_probe_vit_params"] = jnp.broadcast_to(params_nonfinite_count(self), (b_dim,))
       # Pixels outside [-1, 1] (SigLIP range) or non-finite: catches finite garbage the plain non-finite count misses.
@@ -622,6 +728,7 @@ class OLMo35VisionEncoder(nnx.Module):
       if return_probes:
         bad = jnp.logical_not(jnp.isfinite(out)).reshape(b_dim, n_crops, p, f_dim)
         probes["nonfinite_probe_vit_feats"] = jnp.sum(bad, axis=(1, 2, 3), dtype=jnp.int32)
+        probes["nonfinite_probe_vit_feats_blocks"] = _blocks(jnp.sum(bad, axis=(2, 3), dtype=jnp.int32), jnp.sum)
         if crop_valid is not None:
           probes["nonfinite_probe_vit_feats_valid"] = jnp.sum(
               jnp.logical_and(bad, crop_valid[:, :, None, None]), axis=(1, 2, 3), dtype=jnp.int32
@@ -632,8 +739,6 @@ class OLMo35VisionEncoder(nnx.Module):
           out = sharding.maybe_shard_with_pspec(out, feat_pspec, self.mesh, self.config.shard_mode)
       return (out, probes) if return_probes else out
 
-    cp_axis = self.config.context_sharding
-    cp_size = self.mesh.shape.get(cp_axis, 1) if self.mesh is not None else 1
     if bool(self.config.olmo_vit_cp_shard_crops) and cp_size > 1 and n_crops % cp_size == 0:
       # Every CP rank shares the same sequence's `n_crops` images. Shard `patches` on `cp_axis`
       # in GSPMD so each CP rank encodes `n_crops // cp_size` crops while ViT weights stay
@@ -649,7 +754,10 @@ class OLMo35VisionEncoder(nnx.Module):
       if bool(getattr(self.config, "olmo_vit_balance_crops", False)) and pooled_patches_idx is not None:
         out = self._encode_balanced(patches, pooled_patches_idx)
       if out is None:
-        out = self._encode_crops_maybe_chunked(patches, cp_sharded=True)
+        out = self._encode_crops_maybe_chunked(patches, cp_sharded=True, probe=return_probes)
+        if return_probes:
+          out, pr = out
+          _layer_probes(pr)
       cp_feat_pspec = PartitionSpec(batch_axes, cp_axis, None)
       out = sharding.maybe_shard_with_pspec(out, cp_feat_pspec, self.mesh, self.config.shard_mode)
       res = _finish(out, cp_feat_pspec)
@@ -667,7 +775,10 @@ class OLMo35VisionEncoder(nnx.Module):
       )
     if crop_valid is not None:
       patches = _select_crops(patches, crop_valid)
-    out = self._encode_crops_maybe_chunked(patches)
+    out = self._encode_crops_maybe_chunked(patches, probe=return_probes)
+    if return_probes:
+      out, pr = out
+      _layer_probes(pr)
     feat_pspec = PartitionSpec(_batch_mesh_spec_entry(self.config, self.mesh), None, None) if self.mesh is not None else None
     return _finish(out, feat_pspec)
 
