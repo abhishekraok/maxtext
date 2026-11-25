@@ -198,6 +198,34 @@ def _document_segment_mask(inputs_segmentation, targets_segmentation, max_segmen
   return (inputs_segmentation > 0) & (untrained_in_seg <= 1)
 
 
+_EOS_ID, _IM_START_ID = 100257, 100264
+
+
+def replay_eos_keep(inputs, inputs_segmentation, targets):
+  """[B, S] bool, False on the targets the replay end-token fix drops. Target i (the next input token, i+1) is dropped
+  iff all of these hold:
+    - it is <|endoftext|>;
+    - input i is in a segment (not padding), and input i+1 is in the same segment, so the target belongs to that
+      document;
+    - input i+1 is that segment's last token, so the target is the document's final token;
+    - the segment's first input token is not <|im_start|>.
+  That is the final token of each long-context replay document (a `document` row, which starts with plain text).
+  Chat rows start with <|im_start|>, so every chat stop stays trained, and an <|endoftext|> inside a non-chat document
+  is kept. Assumes whole documents within rows, as the prepacked stream packs them (a document cut at a row's end
+  would have its cut point taken for its end)."""
+  seg = inputs_segmentation
+  s = seg.shape[-1]
+  idx = jnp.broadcast_to(jnp.arange(s, dtype=jnp.int32), seg.shape)
+  is_start = jnp.concatenate([jnp.ones_like(seg[:, :1], dtype=bool), seg[:, 1:] != seg[:, :-1]], axis=1)
+  start = jax.lax.cummax(jnp.where(is_start, idx, 0), axis=1)
+  first = jnp.take_along_axis(inputs, start, axis=1)
+  past = jnp.full_like(seg[:, :2], -1)  # no segment past the row's end
+  seg_ext = jnp.concatenate([seg, past], axis=1)
+  nxt, nxt2 = seg_ext[:, 1 : s + 1], seg_ext[:, 2 : s + 2]
+  last_target = (seg > 0) & (nxt == seg) & (nxt2 != seg)
+  return ~((targets == _EOS_ID) & last_target & (first != _IM_START_ID))
+
+
 EXPERT_COUNT_NAMES: list = []
 
 def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_train=True):
@@ -309,6 +337,20 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
   if indexer_losses_state is not None:
     intermediate_outputs["indexer_losses"] = indexer_losses_state.to_pure_dict()
 
+  # Replay end-token fix: no loss on a replay document's final <|endoftext|> (replay_eos_keep). Applied after the
+  # forward pass, so the forward is unchanged. The token CE, output z-loss and token divisor below read the masked
+  # targets_segmentation; forward-computed router losses keep their own masks. The document-role log classifies rows
+  # with the unmasked mask.
+  targets_segmentation_unmasked = data["targets_segmentation"]
+  data = dict(
+      data,
+      targets_segmentation=targets_segmentation_unmasked
+      * replay_eos_keep(data["inputs"], data["inputs_segmentation"], data["targets"]).astype(
+          targets_segmentation_unmasked.dtype
+      ),
+  )
+  max_logging.log("replay_eos_mask: loss drops the final <|endoftext|> target of documents not starting with <|im_start|>")
+
   if (
       getattr(config, "olmo_text_loss_group_weight", 0.0) > 0.0
       and getattr(config, "olmo_vision_loss_group_weight", 0.0) > 0.0
@@ -353,7 +395,7 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       # replay, every token trained) separately from chat segments, to compare per-source CE with GPU runs whose
       # batches mix sources differently. A second forward-only pass of the fused head over the document tokens; the
       # result goes to aux only, so gradients are unchanged.
-      doc_mask = _document_segment_mask(data["inputs_segmentation"], data["targets_segmentation"])
+      doc_mask = _document_segment_mask(data["inputs_segmentation"], targets_segmentation_unmasked)
       doc_data = dict(data, targets_segmentation=data["targets_segmentation"] * doc_mask.astype(data["targets_segmentation"].dtype))
       doc_xent_sum, doc_z_sum = fused_lm_head_ce_nnx_loss(
           model, jax.lax.stop_gradient(hidden_states), doc_data, config, is_train
