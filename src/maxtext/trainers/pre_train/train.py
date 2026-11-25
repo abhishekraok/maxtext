@@ -1492,7 +1492,8 @@ def required_rbf_log_lines(config, step, probe, suffix=""):
   if dropped is not None:
     lines.append(
         f"MOE-DROPPED step={step} dropped={dropped.sum():.0f} routed={routed.sum():.0f} "
-        f"frac={dropped.sum() / max(routed.sum(), 1.0):.3e} per_layer=[{','.join(f'{v:.0f}' for v in dropped)}]{suffix}"
+        f"frac={dropped.sum() / max(routed.sum(), 1.0):.3e} per_layer=[{','.join(f'{v:.0f}' for v in dropped)}] "
+        f"routed_per_layer=[{','.join(f'{v:.0f}' for v in routed)}]{suffix}"
     )
   return lines
 
