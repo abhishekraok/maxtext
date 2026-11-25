@@ -54,7 +54,10 @@ def main():
 
   image_rows = args.dose / (args.seq * args.pack_fill)
   image_rows = int(math.ceil(image_rows / args.rows) * args.rows)  # whole steps' worth, so steps are integral
-  steps = (args.text_rows + image_rows) // args.rows
+  # U = ceil((T + I) / R) and image slots R x U - T, so the loader's check (steps x rows - image rows = text rows)
+  # holds when T is not a multiple of R; the extra slots (< R) are image rows past the dose.
+  steps = -(-(args.text_rows + image_rows) // args.rows)
+  dose_rows, image_rows = image_rows, steps * args.rows - args.text_rows
   share = total_mass / (total_mass + args.text_supervised)
   out = {
       "_note": (
@@ -68,6 +71,7 @@ def main():
           "image_loss_mass": total_mass,
           "text_rows": args.text_rows,
           "text_supervised_tokens": args.text_supervised,
+          "image_dose_rows": dose_rows,
           "image_rows": image_rows,
           "steps_text_matched": steps,
           "image_loss_share": share,
