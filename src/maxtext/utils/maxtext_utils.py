@@ -2513,6 +2513,39 @@ def create_device_mesh(config, devices=None):
         if config.optimize_mesh_for_tpu_v6e:
           mesh = max_utils.optimize_mesh_for_tpu_v6e(mesh, devices)
 
+  if mesh.shape == (8, 1, 2, 32) and jax.process_index() == 0:
+    # Reconstruct the candidate on these same live devices before either data reshard.
+    candidate_mesh = mesh_utils.create_device_mesh(
+        (4, 1, 4, 32),
+        devices,
+        contiguous_submeshes=False,
+        allow_split_physical_axes=allow_split_physical_axes,
+    )
+    orders = []
+    for layout in (candidate_mesh, mesh):
+      row_devices = layout.flat[:16]
+      processes = sorted({device.process_index for device in row_devices})
+      if processes != [0, 1, 4, 5]:
+        raise ValueError(f"H251 expected the four candidate data processes, saw {processes}")
+      offsets = dict.fromkeys(processes, 0)
+      rows = []
+      for device in row_devices:
+        pid = device.process_index
+        rows.append((tuple(device.coords), pid, processes.index(pid), offsets[pid]))
+        offsets[pid] += 1
+      if any(count != 4 for count in offsets.values()):
+        raise ValueError(f"H251 expected four input rows per process, saw {offsets}")
+      orders.append(rows)
+
+    if orders[0] != orders[1]:
+      raise ValueError(f"H251 ordered input rows differ: {orders}")
+    for row, (coords, pid, ordinal, local_row) in enumerate(orders[1]):
+      max_logging.log(
+          f"H251-INPUT-ROW row={row} coords={coords} process={pid} ordinal={ordinal} local_row={local_row}"
+      )
+    max_logging.log("H251-INPUT-ROW-ORDER matches candidate")
+    max_logging.log(f"H251-FSDP-GROUP coords={[tuple(d.coords) for d in mesh[0, 0, :, 0]]}")
+    max_logging.log(f"H251-DATA-GROUP coords={[tuple(d.coords) for d in mesh[:, 0, 0, 0]]}")
   max_logging.log(f"Num_devices: {num_devices}, shape {mesh.shape}")
 
   return mesh
