@@ -547,7 +547,7 @@ def preprocessing_pipeline(
       sampler=dummy_index_sampler,
       worker_count=grain_worker_count,  # only supports <=1 for now, more workers results in duplicated data
       worker_buffer_size=1,
-      read_options=grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=128),
+      read_options=grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=int(__import__("os").environ.get("MAXTEXT_HF_PREFETCH_ROWS", "128"))),
   )
 
   multihost_gen = multihost_dataloading.MultiHostDataLoadIterator(dataloader, global_mesh, generate_padding_batch)
