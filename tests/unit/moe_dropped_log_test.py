@@ -14,7 +14,7 @@ def test_dropped_and_routed_per_layer():
   assert lines[0].startswith("REQUIRED_RBF step=12 max=3.0000 per_layer=[1.5000,2.2500,3.0000]")
   m = re.fullmatch(r"MOE-DROPPED step=12 dropped=9 routed=310 frac=(\S+) per_layer=\[2,0,7\] "
                    r"routed_per_layer=\[100,120,90\] program=train", lines[1])
-  assert m and abs(float(m.group(1)) - 9 / 310) < 1e-6, lines[1]
+  assert m and abs(float(m.group(1)) - 9 / 310) < 5e-5, lines[1]  # frac is printed to 4 significant figures
 
 
 def test_ring_of_experts_logs_minus_one():
