@@ -267,7 +267,7 @@ class PrepackedMixedTest(unittest.TestCase):
         # Checks: wrong update, binding, counts, tampered payload, missing file -> fallback with a reason.
         self.assertIsNone(mm.load_loader_state(base, u + 1, 0, binding, consumed)[0])
         self.assertIsNone(mm.load_loader_state(base, u, 0, dict(binding, image_rows=n_img + 1), consumed)[0])
-        self.assertIsNone(mm.load_loader_state(base, u, 0, binding, dict(consumed, **{0: consumed[0] + 1}))[0])
+        self.assertIsNone(mm.load_loader_state(base, u, 0, binding, {**consumed, 0: consumed[0] + 1})[0])
         doc = _json.loads(open(path).read())
         doc["payload"]["ranks"]["0"]["consumed"] += 0
         doc["payload"]["update"] = u + 100
