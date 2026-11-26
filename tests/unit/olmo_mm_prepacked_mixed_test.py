@@ -251,6 +251,59 @@ class PrepackedMixedTest(unittest.TestCase):
         for key in b:
           np.testing.assert_array_equal(b[key], batches[k][key])
 
+  def test_saved_state_resume_equals_uninterrupted_and_checks_fall_back(self):
+    """H269 saved-state resume: a checkpoint of update u records each image rank's loader state as of u (not the
+    host's read-ahead); restoring it gives the uninterrupted batches; a bad or missing file falls back (None)."""
+    import json as _json  # pylint: disable=import-outside-toplevel
+
+    steps, n_img, local_rows = 30, 24, [0, 1, 2, 3]
+
+    class StatefulImageLoader(FakeImageLoader):
+
+      def __init__(self, rank, consumed, loader_state=None):
+        super().__init__(rank, consumed)
+        if loader_state is not None:
+          self.k = loader_state["k"]  # a real loader restores its OLMo-core state instead of redrawing
+
+      def loader_state(self):
+        return {"k": self.k, "tuple": (self.rank, self.k)}
+
+    def loader(next_step, rank_states=None):
+      return mm._PrepackedMixedHostLoader(  # pylint: disable=protected-access
+          local_rows=local_rows, cutoff=self.rows, text=mm.PrepackedTextRows(self.tmp.name),
+          schedule=mm.ImageSlotSchedule(self.rows, steps, n_img), image_loader_for_rank=StatefulImageLoader,
+          next_step=next_step, convert_kwargs=CONVERT, host=0, hash_steps=-1, rank_states=rank_states)
+
+    sch = mm.ImageSlotSchedule(self.rows, steps, n_img)
+    reference = loader(1)
+    batches = [next(reference) for _ in range(steps)]
+    with tempfile.TemporaryDirectory() as base:
+      for u in (5, 12, 20):
+        run = loader(1)
+        for _ in range(u + 2):  # the host has read two steps past the checkpoint's update
+          next(run)
+        path = mm.save_active_loader_state(base, u, host=0)
+        binding = {"rows": self.rows, "steps": steps, "image_rows": n_img, "image_config_sha256": "",
+                   "local_rows": local_rows}
+        consumed = {r: sch.image_count_before_step(r, u + 1) for r in local_rows}
+        states, why = mm.load_loader_state(base, u, 0, binding, consumed)
+        self.assertEqual(why, "")
+        self.assertEqual(states[0]["tuple"], (0, consumed[0]))  # pickled: the tuple survives exactly
+        resumed = loader(u + 1, rank_states=states)
+        for k in range(u, steps):
+          b = next(resumed)
+          for key in b:
+            np.testing.assert_array_equal(b[key], batches[k][key])
+        # Checks: wrong update, binding, counts, tampered payload, missing file -> fallback with a reason.
+        self.assertIsNone(mm.load_loader_state(base, u + 1, 0, binding, consumed)[0])
+        self.assertIsNone(mm.load_loader_state(base, u, 0, dict(binding, image_rows=n_img + 1), consumed)[0])
+        self.assertIsNone(mm.load_loader_state(base, u, 0, binding, dict(consumed, **{0: consumed[0] + 1}))[0])
+        doc = _json.loads(open(path).read())
+        doc["payload"]["ranks"]["0"]["consumed"] += 0
+        doc["payload"]["update"] = u + 100
+        open(path, "w").write(_json.dumps(doc))
+        self.assertIn("sha256", mm.load_loader_state(base, u, 0, binding, consumed)[1])
+
   @unittest.skipUnless(os.environ.get("PREPACKED_REAL_DIR"), "set PREPACKED_REAL_DIR")
   def test_real_files_match_text_team_reader(self):
     root = os.environ["PREPACKED_REAL_DIR"]

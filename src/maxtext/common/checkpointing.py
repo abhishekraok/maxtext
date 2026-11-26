@@ -1554,10 +1554,26 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
     )
   if checkpoint_saved:
     print_save_message(actual_step, config.async_checkpointing)
+    _save_olmo_mm_loader_state(actual_step)
 
   # Wait for any pending checkpoint save to finish during preemption or final
   # step save, then raise upon preemption.
   _handle_post_checkpoint_preemption(checkpoint_manager, actual_step, force_ckpt_save)
+
+
+def _save_olmo_mm_loader_state(actual_step):
+  """H269 saved-state resume: the joint loader's image-rank states as of the update this checkpoint holds (Orbax
+  label s = s + 1 updates). Only when that loader is active; a failure is logged and never fails the save."""
+  try:
+    from maxtext.input_pipeline import olmo_mm_data_processing as mm  # pylint: disable=import-outside-toplevel
+
+    loader = mm._ACTIVE_PREPACKED_LOADER  # pylint: disable=protected-access
+    if loader is None or not getattr(loader, "_state_base_dir", ""):
+      return
+    path = mm.save_active_loader_state(loader._state_base_dir, int(actual_step) + 1, jax.process_index())  # pylint: disable=protected-access
+    max_logging.log(f"OLMO-MM-LOADER-STATE saved update={int(actual_step) + 1} path={path}")
+  except Exception as e:  # pylint: disable=broad-except
+    max_logging.log(f"OLMO-MM-LOADER-STATE save failed at update {int(actual_step) + 1}: {type(e).__name__}: {e}")
 
 
 def _filter_lora_trainable_state(state):
