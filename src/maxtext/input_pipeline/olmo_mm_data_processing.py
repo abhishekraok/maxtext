@@ -1945,9 +1945,18 @@ class _PrepackedMixedHostLoader:
     if schedule.image_rows > 0:
       if image_loader_for_rank is None:
         raise ValueError("OLMO_MM_IMAGE_ROWS > 0 needs olmo_mm_config_path (an image-only OLMo-core mixture)")
-      for r in trained:
-        consumed = schedule.image_count_before_step(r, self._step)
-        self._image_loaders[r] = image_loader_for_rank(r, consumed)
+      # Build the host's rank loaders concurrently: on a resume each replays every image row its rank already drew
+      # (next() over the OLMo-core loader), so a sequential build costs the sum over ranks. Each rank's loader is
+      # independent (its own shard of the stream and its own workers), so building them in parallel changes no row.
+      consumed = {r: schedule.image_count_before_step(r, self._step) for r in trained}
+      if len(trained) > 1:
+        import concurrent.futures  # pylint: disable=import-outside-toplevel
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(trained)) as pool:
+          futures = {r: pool.submit(image_loader_for_rank, r, consumed[r]) for r in trained}
+          self._image_loaders = {r: futures[r].result() for r in trained}
+      else:
+        self._image_loaders = {r: image_loader_for_rank(r, consumed[r]) for r in trained}
     self._template = None
     self._pool = None
 

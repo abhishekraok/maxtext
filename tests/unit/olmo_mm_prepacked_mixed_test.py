@@ -221,6 +221,36 @@ class PrepackedMixedTest(unittest.TestCase):
       for key in b:
         np.testing.assert_array_equal(b[key], batches[k][key])
 
+  def test_rank_loaders_build_concurrently_with_the_same_batches(self):
+    """A host's image rank loaders are built in parallel (a resume replays each rank's drawn rows): the build waits on
+    all four at once, and the batches equal an uninterrupted run's after a resume."""
+    import threading  # pylint: disable=import-outside-toplevel
+
+    steps, n_img, local_rows = 30, 24, [0, 1, 2, 3]
+    barrier = threading.Barrier(4, timeout=10)
+
+    class BarrierImageLoader(FakeImageLoader):
+
+      def __init__(self, rank, consumed):
+        barrier.wait()  # raises BrokenBarrierError unless all four ranks are being built at once
+        super().__init__(rank, consumed)
+
+    def loader(next_step, factory):
+      return mm._PrepackedMixedHostLoader(  # pylint: disable=protected-access
+          local_rows=local_rows, cutoff=self.rows, text=mm.PrepackedTextRows(self.tmp.name),
+          schedule=mm.ImageSlotSchedule(self.rows, steps, n_img), image_loader_for_rank=factory,
+          next_step=next_step, convert_kwargs=CONVERT, host=0, hash_steps=-1)
+
+    reference = loader(1, FakeImageLoader)
+    batches = [next(reference) for _ in range(steps)]
+    for start in (1, 11, 25):
+      barrier.reset()
+      resumed = loader(start, BarrierImageLoader)
+      for k in range(start - 1, steps):
+        b = next(resumed)
+        for key in b:
+          np.testing.assert_array_equal(b[key], batches[k][key])
+
   @unittest.skipUnless(os.environ.get("PREPACKED_REAL_DIR"), "set PREPACKED_REAL_DIR")
   def test_real_files_match_text_team_reader(self):
     root = os.environ["PREPACKED_REAL_DIR"]
