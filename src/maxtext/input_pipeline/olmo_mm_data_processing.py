@@ -1479,8 +1479,11 @@ class _LiveMixtureHostLoader:
       batch_prefetch_depth: Optional[int] = None,
       prefetch_max_in_flight: Optional[int] = None,
       pack_buffer_size: Optional[int] = None,
+      loader_state: Optional[dict] = None,
   ):
     # olmo_mm_batch_hash_steps: log OLMo-core batch hashes of this rank's batches 1..batch_hash_steps.
+    # loader_state: an OLMo-core MixtureDataLoader state_dict() saved after ``initial_batch_step`` batches (H269's
+    # saved-state resume, OLMO_MM_LOADER_STATE_RESTORE=1); restored instead of redrawing those batches.
     self._rank = int(shard_index)
     self._batch_step = int(initial_batch_step)
     self._batch_hash_steps = int(batch_hash_steps)
@@ -1521,6 +1524,10 @@ class _LiveMixtureHostLoader:
     self._reset_positions = bool(reset_positions_on_segment)
     self._use_loss_weights = bool(use_loss_weights)
 
+    if loader_state is not None:
+      self._loader.load_state_dict(loader_state)
+      self._iter = iter(self._loader)
+      return
     self._iter = iter(self._loader)
     for _ in range(int(initial_batch_step)):
       try:
@@ -1529,6 +1536,10 @@ class _LiveMixtureHostLoader:
         self._loader.reshuffle()
         self._iter = iter(self._loader)
         next(self._iter)
+
+  def loader_state(self) -> dict:
+    """The OLMo-core loader's state after the batches this loader has handed over (not its read-ahead)."""
+    return self._loader.state_dict()
 
   def __iter__(self):
     return self
@@ -1928,6 +1939,7 @@ class _PrepackedMixedHostLoader:
       host: int,
       hash_steps: int,
       replay_eos_mask: bool = False,
+      rank_states: Optional[dict] = None,  # {rank: OLMo-core loader state at next_step - 1} (saved-state resume)
   ):
     self._local_rows = list(local_rows)
     self._cutoff = int(cutoff)
@@ -1947,7 +1959,29 @@ class _PrepackedMixedHostLoader:
         raise ValueError("OLMO_MM_IMAGE_ROWS > 0 needs olmo_mm_config_path (an image-only OLMo-core mixture)")
       for r in trained:
         consumed = schedule.image_count_before_step(r, self._step)
+        if rank_states is not None:  # every rank or none: the caller checked the file covers this host's ranks
+          try:
+            self._image_loaders[r] = image_loader_for_rank(r, consumed, loader_state=rank_states[r])
+            continue
+          except Exception as e:  # pylint: disable=broad-except
+            max_logging.log(f"OLMO-MM-LOADER-STATE rank {r} restore failed, redrawing: {type(e).__name__}: {e}")
         self._image_loaders[r] = image_loader_for_rank(r, consumed)
+    # Saved-state resume: each rank's loader state after the last step it drew in, so a checkpoint of update u can
+    # record every rank's state as of u (not the prefetch thread's read-ahead). A rank draws at most once a step and
+    # the host prefetches at most a couple of steps, so the last 8 snapshots always include one at or before u.
+    import threading  # pylint: disable=import-outside-toplevel
+
+    self._snap_lock = threading.Lock()
+    self._snaps = {}
+    try:  # bookkeeping only: a failure disables the state files (a resume then redraws), never the loader
+      for r, loader in self._image_loaders.items():
+        if hasattr(loader, "loader_state"):
+          self._snaps[r] = [(self._step - 1, loader.loader_state())]
+    except Exception as e:  # pylint: disable=broad-except
+      self._snaps = {}
+      max_logging.log(f"OLMO-MM-LOADER-STATE snapshots disabled: {type(e).__name__}: {e}")
+    global _ACTIVE_PREPACKED_LOADER  # pylint: disable=global-statement
+    _ACTIVE_PREPACKED_LOADER = self
     self._template = None
     self._pool = None
 
@@ -1974,6 +2008,19 @@ class _PrepackedMixedHostLoader:
       import concurrent.futures  # pylint: disable=import-outside-toplevel
       self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(self._image_loaders)))
     pending = {r: self._pool.submit(next, self._image_loaders[r]) for r in image_rows}
+    if self._snaps:
+      for r in image_rows:
+        pending[r].result()  # the same future the row loop below reads; an error raises here instead of there
+      try:  # bookkeeping only, as in __init__
+        for r in image_rows:
+          if r in self._snaps:
+            state = self._image_loaders[r].loader_state()
+            with self._snap_lock:
+              self._snaps[r] = (self._snaps[r] + [(step, state)])[-8:]
+      except Exception as e:  # pylint: disable=broad-except
+        with self._snap_lock:
+          self._snaps = {}
+        max_logging.log(f"OLMO-MM-LOADER-STATE snapshots disabled at step {step}: {type(e).__name__}: {e}")
     for row in self._local_rows:
       if row >= self._cutoff:
         rows.append(None)
@@ -2012,6 +2059,94 @@ class _PrepackedMixedHostLoader:
       max_logging.log(line)
     self._step += 1
     return out
+
+  def rank_states_at(self, update: int) -> Optional[dict]:
+    """Every local rank's loader state as of ``update`` (its newest snapshot at or before it), or None."""
+    out = {}
+    with self._snap_lock:
+      for r, snaps in self._snaps.items():
+        older = [st for s, st in snaps if s <= update]
+        if not older:
+          return None
+        out[r] = older[-1]
+    return out
+
+
+_ACTIVE_PREPACKED_LOADER = None
+LOADER_STATE_DIR = "olmo_mm_loader_state"
+
+
+def _loader_state_path(base_dir: str, update: int, host: int) -> str:
+  return os.path.join(base_dir, LOADER_STATE_DIR, f"u{int(update):07d}", f"host{int(host):04d}.json")
+
+
+def _loader_state_binding(loader: "_PrepackedMixedHostLoader", cfg_sha256: str) -> dict:
+  sch = loader._schedule  # pylint: disable=protected-access
+  return {"rows": sch.rows, "steps": sch.steps, "image_rows": sch.image_rows, "image_config_sha256": cfg_sha256,
+          "local_rows": list(loader._local_rows)}  # pylint: disable=protected-access
+
+
+def save_active_loader_state(base_dir: str, update: int, host: int) -> Optional[str]:
+  """Write this host's image-rank loader states as of ``update`` (the checkpoint's update count). Returns the path.
+
+  One object per host: JSON {"payload": {...}, "sha256": sha256 of the payload's canonical JSON}; each rank's
+  OLMo-core state is pickled (tuples kept exact) and base64-encoded. Binding: schedule, image config sha256, the
+  host's global rows, and each rank's consumed-image count, which a restore checks before trusting the file.
+  """
+  import base64  # pylint: disable=import-outside-toplevel
+  import pickle  # pylint: disable=import-outside-toplevel
+
+  loader = _ACTIVE_PREPACKED_LOADER
+  if loader is None or not loader._snaps:  # pylint: disable=protected-access
+    return None
+  states = loader.rank_states_at(int(update))
+  if states is None:
+    return None
+  sch = loader._schedule  # pylint: disable=protected-access
+  payload = {
+      "update": int(update),
+      "host": int(host),
+      "binding": _loader_state_binding(loader, getattr(loader, "_cfg_sha256", "")),
+      "ranks": {
+          str(r): {"consumed": sch.image_count_before_step(r, int(update) + 1),
+                   "state": base64.b64encode(pickle.dumps(st, protocol=4)).decode("ascii")}
+          for r, st in sorted(states.items())
+      },
+  }
+  body = json.dumps(payload, sort_keys=True)
+  path = _loader_state_path(base_dir, update, host)
+  epath.Path(path).parent.mkdir(parents=True, exist_ok=True)
+  epath.Path(path).write_text(json.dumps({"payload": payload, "sha256": hashlib.sha256(body.encode()).hexdigest()}))
+  return path
+
+
+def load_loader_state(base_dir: str, update: int, host: int, binding: dict, consumed: dict) -> Tuple[Optional[dict], str]:
+  """(rank states, "") if this host's file for ``update`` exists and passes every check, else (None, reason)."""
+  import base64  # pylint: disable=import-outside-toplevel
+  import pickle  # pylint: disable=import-outside-toplevel
+
+  path = _loader_state_path(base_dir, update, host)
+  try:
+    doc = json.loads(epath.Path(path).read_text())
+  except Exception as e:  # pylint: disable=broad-except
+    return None, f"cannot read {path}: {type(e).__name__}"
+  payload = doc.get("payload", {})
+  if hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest() != doc.get("sha256"):
+    return None, f"{path}: sha256 mismatch"
+  if payload.get("update") != int(update) or payload.get("host") != int(host):
+    return None, f"{path}: update/host {payload.get('update')}/{payload.get('host')} != {update}/{host}"
+  if payload.get("binding") != binding:
+    return None, f"{path}: binding differs (schedule, image config or host rows)"
+  ranks = payload.get("ranks", {})
+  if sorted(int(r) for r in ranks) != sorted(consumed):
+    return None, f"{path}: ranks {sorted(ranks)} != {sorted(consumed)}"
+  out = {}
+  for r, want in consumed.items():
+    entry = ranks[str(r)]
+    if entry.get("consumed") != want:
+      return None, f"{path}: rank {r} consumed {entry.get('consumed')} != {want}"
+    out[r] = pickle.loads(base64.b64decode(entry["state"]))
+  return out, ""
 
 
 def _make_prepacked_mixed_loader(config, *, global_mesh, global_load: int, resumed_step: int, caps: tuple):
@@ -2067,7 +2202,7 @@ def _make_prepacked_mixed_loader(config, *, global_mesh, global_load: int, resum
         cfg_path, work_dir=work_dir, path_remap_from=remap_from, path_remap_to=remap_to
     )
 
-    def image_loader_for_rank(rank, consumed):  # pylint: disable=function-redefined
+    def image_loader_for_rank(rank, consumed, loader_state=None):  # pylint: disable=function-redefined
       return _LiveMixtureHostLoader(
           config_path=cfg_path,
           work_dir=work_dir,
@@ -2090,15 +2225,30 @@ def _make_prepacked_mixed_loader(config, *, global_mesh, global_load: int, resum
           initial_batch_step=consumed,
           dataset=dataset,
           batch_hash_steps=int(getattr(config, "olmo_mm_batch_hash_steps", 0) or 0),
+          loader_state=loader_state,
       )
 
   next_step = int(resumed_step) + int(os.environ.get("OLMO_MM_RESUME_STEP_OFFSET", "0") or 0) + 1
+  # Saved-state resume (H269), off unless OLMO_MM_LOADER_STATE_RESTORE=1: restore each image rank's OLMo-core loader
+  # state from the file the checkpoint of update next_step - 1 wrote, instead of redrawing its past rows. Any missing
+  # or failed check falls back to the redraw for the whole host.
+  cfg_sha256 = hashlib.sha256(epath.Path(cfg_path).read_bytes()).hexdigest() if cfg_path else ""
+  base_dir = os.path.join(str(config.base_output_directory), str(config.run_name))
+  rank_states = None
+  if image_rows > 0 and next_step > 1 and os.environ.get("OLMO_MM_LOADER_STATE_RESTORE", "0") == "1":
+    trained = sorted({r for r in local_rows if r < cutoff})
+    binding = {"rows": cutoff, "steps": steps, "image_rows": image_rows, "image_config_sha256": cfg_sha256,
+               "local_rows": list(local_rows)}
+    rank_states, why = load_loader_state(base_dir, next_step - 1, jax.process_index(), binding,
+                                         {r: schedule.image_count_before_step(r, next_step) for r in trained})
+    max_logging.log(f"OLMO-MM-LOADER-STATE host={jax.process_index()} update={next_step - 1} " +
+                    ("restored ranks " + str(trained) if rank_states is not None else "fallback to redraw: " + why))
   max_logging.log(
       f"OLMo MM prepacked text + image rows: text={text_dir} ({text.rows_per_file} rows/file) image_rows={image_rows} "
       f"steps={steps} trained rows/step={cutoff} text rows={schedule.text_rows} (files 1..{last_file}) "
       f"images={cfg_path or '-'} host={jax.process_index()} loads global rows {local_rows} next_step={next_step}"
   )
-  return _PrepackedMixedHostLoader(
+  loader = _PrepackedMixedHostLoader(
       local_rows=local_rows,
       cutoff=cutoff,
       text=text,
@@ -2109,7 +2259,11 @@ def _make_prepacked_mixed_loader(config, *, global_mesh, global_load: int, resum
       host=jax.process_index(),
       hash_steps=int(os.environ.get("OLMO_MM_ROW_HASH_STEPS", "-1")),
       replay_eos_mask=bool(getattr(config, "olmo_mm_text_replay_eos_mask", False)),
+      rank_states=rank_states,
   )
+  loader._cfg_sha256 = cfg_sha256  # pylint: disable=protected-access
+  loader._state_base_dir = base_dir  # pylint: disable=protected-access
+  return loader
 
 
 def _make_mm_loader_for_host(

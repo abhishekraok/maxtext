@@ -1554,10 +1554,44 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
     )
   if checkpoint_saved:
     print_save_message(actual_step, config.async_checkpointing)
+    _save_olmo_mm_loader_state(actual_step)
 
   # Wait for any pending checkpoint save to finish during preemption or final
   # step save, then raise upon preemption.
   _handle_post_checkpoint_preemption(checkpoint_manager, actual_step, force_ckpt_save)
+
+
+def _save_olmo_mm_loader_state(actual_step):
+  """H269 saved-state resume: the joint loader's image-rank states as of the update this checkpoint holds (Orbax
+  label s = s + 1 updates). Only when that loader is active. Isolated from training and from the Orbax save, which
+  has already been issued: the write runs in a daemon thread that catches and logs every error, and the trainer
+  waits for it at most 60 s (so a preemption save usually has its file); a file that is late or missing only makes
+  a resume redraw."""
+  import threading  # pylint: disable=import-outside-toplevel
+
+  update = int(actual_step) + 1
+
+  def write():
+    try:
+      from maxtext.input_pipeline import olmo_mm_data_processing as mm  # pylint: disable=import-outside-toplevel
+
+      loader = mm._ACTIVE_PREPACKED_LOADER  # pylint: disable=protected-access
+      if loader is None or not getattr(loader, "_state_base_dir", ""):
+        return
+      t0 = time.time()
+      path = mm.save_active_loader_state(loader._state_base_dir, update, jax.process_index())  # pylint: disable=protected-access
+      max_logging.log(f"OLMO-MM-LOADER-STATE saved update={update} path={path} write_s={time.time() - t0:.2f}")
+    except Exception as e:  # pylint: disable=broad-except
+      max_logging.log(f"OLMO-MM-LOADER-STATE save failed at update {update}: {type(e).__name__}: {e}")
+
+  try:
+    thread = threading.Thread(target=write, name="olmo-mm-loader-state", daemon=True)
+    thread.start()
+    thread.join(timeout=60)
+    if thread.is_alive():
+      max_logging.log(f"OLMO-MM-LOADER-STATE save for update {update} still writing after 60 s; training continues")
+  except Exception as e:  # pylint: disable=broad-except
+    max_logging.log(f"OLMO-MM-LOADER-STATE save failed at update {update}: {type(e).__name__}: {e}")
 
 
 def _filter_lora_trainable_state(state):
