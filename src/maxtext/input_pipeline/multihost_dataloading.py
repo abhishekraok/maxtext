@@ -296,8 +296,10 @@ class MultiHostDataLoadIterator:
       idx = int(seen.get(str(state.get("last_worker_index")), max(seen.values())))
       if self._sampler_base is None:
         sampler = getattr(self.dataloader, "_sampler")
-        self._sampler_base = int(sampler[0].index)
-        self._sampler_stride = int(sampler[1].index) - self._sampler_base
+        # Grain's last_seen_indices are global sampler indices; the HF iterator is already sharded, so the row
+        # position is (idx - shard_index) // shard_count (checkpoint-intake's fix, #1437 comment 7030586133).
+        self._sampler_base = int(sampler._shard_options.shard_index)
+        self._sampler_stride = int(sampler._shard_options.shard_count)
       pos = (idx - self._sampler_base) // self._sampler_stride
       # Measured (CPU test, grain PackAndBatchOperation): the next batch starts at raw row `pos` (0-based), i.e. the
       # packed batch's metadata index is that of the row which closed it; resuming must skip exactly `pos` rows.
@@ -614,35 +616,69 @@ class RemoteIteratorWrapper:
     self.local_iterator.restore_state(step_array)  # pyrefly: ignore[missing-attribute]
 
 
-def write_data_state(step: int) -> None:
-  """Writes this host's raw-row position for trained step `step` to MAXTEXT_DATA_STATE_DIR/step{step}/host{p}.json."""
-  if not _DATA_STATE_DIR:
+def shard_of(it):
+  """(shard index, shard count) of a training iterator's grain sampler, or (None, None)."""
+  opts = getattr(getattr(getattr(it, "dataloader", None), "_sampler", None), "_shard_options", None)
+  return (None, None) if opts is None else (int(opts.shard_index), int(opts.shard_count))
+
+
+def _pin():
+  from maxtext.input_pipeline import fast_cursor  # pylint: disable=import-outside-toplevel
+
+  return fast_cursor.pin_from_env(os.environ, lambda path: epath.Path(path).read_bytes(), log=max_logging.log)
+
+
+def write_data_state(step: int, batches: int | None = None, identity: str | None = None, config: dict | None = None):
+  """Fast cursor: this host's cursor for the save of update `step` (`batches` pulled), bound to the checkpoint's
+  `identity`, the run's pinned receipt and its loader `config`, as one object under MAXTEXT_DATA_STATE_DIR
+  (input_pipeline/fast_cursor.py). Only the training iterator is recorded. The legacy one-argument call (H262's
+  perf_wrapper SKIP_IDLE_SAVE) writes nothing: the save hook in train_sft.py writes after Tunix initiates the save.
+  Never raises: a cursor that cannot be written is a fallback at restore, not a failed save."""
+  if not _DATA_STATE_DIR or batches is None or identity is None or config is None:
     return
-  for it in list(_GLOBAL_MULTIHOST_ITERATORS):
-    raw_at = getattr(it, "_raw_at", None)
-    if raw_at and step in raw_at:
-      out = epath.Path(_DATA_STATE_DIR) / f"step{step:07d}" / f"host{jax.process_index():04d}.json"
-      out.parent.mkdir(parents=True, exist_ok=True)
-      out.write_text(json.dumps({"step": step, "raw_rows_consumed": int(raw_at[step]), "host": jax.process_index()}))
-      max_logging.log(f"DATA-STATE step={step} raw_rows_consumed={raw_at[step]} -> {out}")
+  host = jax.process_index()
+  try:
+    from maxtext.input_pipeline import fast_cursor  # pylint: disable=import-outside-toplevel
+
+    pin = _pin()
+    for it in [i for i in list(_GLOBAL_MULTIHOST_ITERATORS) if getattr(i, "_fast_cursor_train", False)]:
+      raw_at = getattr(it, "_raw_at", {}) or {}
+      padding = bool(getattr(it, "out_of_data", False))
+      source = getattr(getattr(it, "dataloader", None), "_data_source", None)
+      index, count = shard_of(it)
+      host_end = pin["ends"].get(index) if pin and index is not None else None
+      why = fast_cursor.eligible(raw_at, batches, padding, getattr(source, "exhausted", None), host_end,
+                                 pin["margin"] if pin else None)
+      if why is None and index is None:
+        why = "no grain sampler shard on this iterator"
+      if why:
+        max_logging.log(f"DATA-STATE step={step} host={host}: no cursor written ({why}); a resume here falls back")
+        return
+      cursor = {"step": int(step), "batches": int(batches), "host": host, "raw_rows_consumed": int(raw_at[batches]),
+                "identity": identity, "shard_index": index, "shard_count": count,
+                "receipt_sha256": pin["receipt_sha256"], **config}
+      sha = fast_cursor.write(epath.Path(_DATA_STATE_DIR), cursor)
+      max_logging.log(f"DATA-STATE step={step} host={host} batches={batches} raw={raw_at[batches]} id={identity} sha256={sha}")
       return
-  max_logging.log(f"DATA-STATE: no recorded position for step {step} on this host")
+    max_logging.log(f"DATA-STATE step={step} host={host}: no training iterator recorded")
+  except Exception as e:  # pylint: disable=broad-except
+    max_logging.log(f"DATA-STATE step={step} host={host}: no cursor written ({e!r}); a resume here falls back")
 
 
-def read_data_state_for_resume(checkpoint_dir: str):
-  """Latest step S with a committed checkpoint and this host's data-state file; returns (S, raw rows) or None."""
+def read_data_state_for_resume(checkpoint_dir: str, grad_accum: int, config: dict):
+  """The newest committed save's verified cursor for this host (a dict), or None (uniform-skip fallback)."""
+  from maxtext.input_pipeline import fast_cursor  # pylint: disable=import-outside-toplevel
+
+  host = jax.process_index()
   if not _DATA_STATE_DIR or not checkpoint_dir:
+    max_logging.log(f"FAST-CURSOR host {host}: fallback: MAXTEXT_DATA_STATE_DIR or checkpoint_dir unset")
     return None
-  ckpt = epath.Path(checkpoint_dir)
-  if not ckpt.exists():
+  try:
+    ckpt = epath.Path(checkpoint_dir)
+    if not ckpt.exists():
+      max_logging.log(f"FAST-CURSOR host {host}: fallback: no checkpoint directory")
+      return None
+  except Exception as e:  # pylint: disable=broad-except
+    max_logging.log(f"FAST-CURSOR host {host}: fallback: {e!r}")
     return None
-  steps = sorted((int(p.name) for p in ckpt.iterdir() if p.name.isdigit()), reverse=True)
-  for step in steps:
-    if not (ckpt / str(step) / "commit_success.txt").exists():
-      continue  # uncommitted (e.g. a save interrupted by a crash): Orbax will not restore it either
-    f = epath.Path(_DATA_STATE_DIR) / f"step{step:07d}" / f"host{jax.process_index():04d}.json"
-    if f.exists():
-      d = json.loads(f.read_text())
-      return step, int(d["raw_rows_consumed"])
-    return None
-  return None
+  return fast_cursor.candidate(ckpt, epath.Path(_DATA_STATE_DIR), host, grad_accum, _pin(), config, log=max_logging.log)

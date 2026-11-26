@@ -244,24 +244,36 @@ class BaseTrainingHooks(GoodputTrainingHooks, abc.ABC):
     """Calculate the number of non-padded tokens in the batch."""
 
 
+def _mark_training_iterator(it):
+  """The fast-cursor writer records only the training iterator, never the eval one."""
+  try:
+    it._fast_cursor_train = True  # pylint: disable=protected-access
+  except AttributeError:
+    pass
+
+
 class BaseDataHooks(DataHooks):
   """Shared data hooks for post-training."""
 
   def __init__(self, config, mesh, goodput_recorder):
     self.config = config
-    self._fast_resume_step = 0
+    self._mesh, self._goodput_recorder = mesh, goodput_recorder
+    self._fast_cursor = None
     if os.environ.get("MAXTEXT_FAST_RESUME") == "1" and not os.environ.get("MAXTEXT_PREPACKED_DIR"):
       # Fast resume: skip this host's already-trained raw rows inside the stream (no tokenization or packing)
-      # instead of replaying every trained batch. Needs MAXTEXT_SFT_GRAIN_TEMPLATE=1 and the per-save data-state
-      # files written by the save hook (MAXTEXT_DATA_STATE_DIR).
+      # instead of replaying every trained batch. Needs MAXTEXT_SFT_GRAIN_TEMPLATE=1 and the cursor sidecars the
+      # save hook writes (MAXTEXT_DATA_STATE_DIR). Checked again against the restored checkpoint before the first batch.
       from maxtext.input_pipeline import multihost_dataloading  # pylint: disable=import-outside-toplevel
 
-      found = multihost_dataloading.read_data_state_for_resume(getattr(config, "checkpoint_dir", ""))
-      if found:
-        self._fast_resume_step, raw = found
-        os.environ["MAXTEXT_DATA_SKIP_RAW"] = str(raw)
-        os.environ["MAXTEXT_DATA_RESUMED_STEP"] = str(self._fast_resume_step)
-        max_logging.log(f"FAST-RESUME: step {self._fast_resume_step}, skipping {raw} raw rows on this host")
+      from maxtext.input_pipeline import fast_cursor  # pylint: disable=import-outside-toplevel
+
+      ga = max(int(getattr(config, "gradient_accumulation_steps", 1) or 1), 1)
+      loader = fast_cursor.loader_config(config.global_batch_size_to_train_on, jax.process_count(), ga)
+      self._fast_cursor = multihost_dataloading.read_data_state_for_resume(
+          getattr(config, "checkpoint_dir", ""), ga, loader)
+      if self._fast_cursor:
+        os.environ["MAXTEXT_DATA_SKIP_RAW"] = str(self._fast_cursor["raw_rows_consumed"])
+        os.environ["MAXTEXT_DATA_RESUMED_STEP"] = str(self._fast_cursor["batches"])
     if os.environ.get("MAXTEXT_PREPACKED_DIR"):
       # Same-batch parity runs: another trainer's packed batches, one file per step (input_pipeline/prepacked.py).
       from maxtext.input_pipeline.prepacked import PrepackedIterator  # pylint: disable=import-outside-toplevel
@@ -270,6 +282,7 @@ class BaseDataHooks(DataHooks):
     else:
       self.train_data_iterator, self.eval_data_iterator = create_data_iterator(config, mesh)
     self.train_data_loader = DataLoader(config, mesh, self.train_data_iterator, goodput_recorder=goodput_recorder)
+    _mark_training_iterator(self.train_data_iterator)
     self.train_batch = None
     self.eval_batch = None
     self._resume_skip_done = False
@@ -282,13 +295,29 @@ class BaseDataHooks(DataHooks):
     """
     self._resume_skip_done = True
     n = train_ctx._iter_steps  # pylint: disable=protected-access
-    if self._fast_resume_step:
-      if n < self._fast_resume_step:
-        raise ValueError(
-            f"FAST-RESUME: the trainer restored step {n}, older than the data state for step {self._fast_resume_step}"
-        )
-      max_logging.log(f"FAST-RESUME: trainer at step {n}; replaying {n - self._fast_resume_step} batches")
-      n -= self._fast_resume_step
+    if self._fast_cursor:
+      from maxtext.input_pipeline import fast_cursor, multihost_dataloading  # pylint: disable=import-outside-toplevel
+
+      host = jax.process_index()
+      index, count = multihost_dataloading.shard_of(self.train_data_iterator)
+      why = fast_cursor.verify_restored(
+          self._fast_cursor, train_ctx._train_steps, n,  # pylint: disable=protected-access
+          getattr(train_ctx, "_restored_custom_metadata", None), index, count)
+      if why is None:
+        max_logging.log(f"FAST-CURSOR host {host}: fast restore at step {self._fast_cursor['step']}, batch {n}, "
+                        f"{self._fast_cursor['raw_rows_consumed']} raw rows skipped")
+        n -= self._fast_cursor["batches"]
+      else:
+        # Explicit fallback: rebuild this host's loader without the skip and replay every trained batch.
+        max_logging.log(f"FAST-CURSOR host {host}: fallback after restore: {why}; rebuilding the loader, uniform skip")
+        self.train_data_iterator._fast_cursor_train = False  # pylint: disable=protected-access
+        os.environ["MAXTEXT_DATA_SKIP_RAW"] = "0"
+        os.environ["MAXTEXT_DATA_RESUMED_STEP"] = "0"
+        self.train_data_iterator, _ = create_data_iterator(self.config, self._mesh)
+        self.train_data_loader = DataLoader(self.config, self._mesh, self.train_data_iterator,
+                                            goodput_recorder=self._goodput_recorder)
+        _mark_training_iterator(self.train_data_iterator)
+        self._fast_cursor = None
     if n <= 0:
       return
     if hasattr(self.train_data_iterator, "skip_steps"):

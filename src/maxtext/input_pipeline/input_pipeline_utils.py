@@ -615,6 +615,8 @@ class HFDataSource(grain.RandomAccessDataSource):
     self.data_iters = []
     # MAXTEXT_DATA_SKIP_RAW=n (set by the trainer on a fast resume): skip this host's first n raw rows on first use.
     self.skip_raw = int(os.environ.get("MAXTEXT_DATA_SKIP_RAW", "0") or 0)
+    # Fast cursor: set once this host has read its last raw row; the packer's final flush comes after it.
+    self.exhausted = False
 
   def _check_shard_count(self):
     if self.n_shards < (self.dataloading_host_count * self.num_threads):
@@ -639,6 +641,7 @@ class HFDataSource(grain.RandomAccessDataSource):
       )
       self.data_iters[idx] = iter(self.datasets[idx])
     else:
+      self.exhausted = True
       raise StopIteration(f"Run out of shards on host {self.dataloading_host_index}, shard {new_shard} is not available")
 
   def __len__(self):

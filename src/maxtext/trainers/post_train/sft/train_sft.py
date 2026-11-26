@@ -100,6 +100,33 @@ def _log_hbm(where):
   )
 
 
+def _install_data_state_save_hook(mt_config):
+  """Fast cursor: each save of update S carries the identity "<nonce>:<S>" in its custom metadata, and after Tunix
+  initiates it each host writes its cursor for batch S x grad_accum with that identity (write_data_state). The nonce is
+  drawn on process 0 and broadcast, so it is the same on every host and new on every attempt."""
+  from jax.experimental import multihost_utils  # pylint: disable=import-outside-toplevel
+  from maxtext.input_pipeline import fast_cursor, multihost_dataloading  # pylint: disable=import-outside-toplevel
+
+  orig = checkpoint_manager_lib.CheckpointManager.save
+  if getattr(orig, "_fast_cursor", False):
+    return
+  ga = max(int(mt_config.gradient_accumulation_steps or 1), 1)
+  loader = fast_cursor.loader_config(mt_config.global_batch_size_to_train_on, jax.process_count(), ga)
+  nonce = int(multihost_utils.broadcast_one_to_all(np.int32(int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF)))
+
+  def save(self, step, *args, custom_metadata=None, **kwargs):
+    ident = fast_cursor.identity(nonce, step)
+    meta = dict(custom_metadata or {})
+    meta[fast_cursor.METADATA_KEY] = ident
+    ok = orig(self, step, *args, custom_metadata=meta, **kwargs)
+    if ok:
+      multihost_dataloading.write_data_state(int(step), int(step) * ga, ident, loader)
+    return ok
+
+  save._fast_cursor = True  # pylint: disable=protected-access
+  checkpoint_manager_lib.CheckpointManager.save = save
+
+
 def _restore_targets_from_live_shardings(state):
   """Restore targets for the optimizer state, taken from the live arrays' own shardings.
 
@@ -634,6 +661,8 @@ def setup_trainer_state(mt_config, goodput_recorder=None):
         lora_utils.restore_lora_from_path(model, mt_config)
       # Restore the optimizer state into the live arrays' shardings (see _restore_targets_from_live_shardings).
       checkpoint_manager_lib._fix_sharding = _restore_targets_from_live_shardings  # pylint: disable=protected-access
+      if os.environ.get("MAXTEXT_DATA_STATE_DIR"):
+        _install_data_state_save_hook(mt_config)
       trainer = _create_trainer(model, optimizer, tunix_config, mt_config)
       _log_hbm("after trainer init (restore included)")
       trainer.with_training_hooks(training_hooks)
