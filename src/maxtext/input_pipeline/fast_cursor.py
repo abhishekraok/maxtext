@@ -25,6 +25,18 @@ Reader, in two stages, each falling back to the registered uniform skip with its
   identity in its custom metadata, and this host's shard must be the recorded one. Otherwise the loader is rebuilt
   without the skip.
 
+Replay-derived cursors (H267 Amendment 6). A save written by a run without this patch has no sidecar and no identity
+in its metadata, so the reader above can never use it. For such a save a cursor can be computed offline from the
+stream's pinned replay (derive_cursor.py: the host's cumulative documents consumed at step S). It is a second,
+explicit kind: its identity is "replay:<S>", and it carries one more field, the digest of the replay pieces it was
+computed from. It is accepted only when all of these hold; otherwise the host falls back as above:
+- the launcher pins this host's sidecar sha256 (MAXTEXT_FAST_CURSOR_REPLAY_SHA256, a JSON object of process index to
+  sha256), and the object read has that sha;
+- its receipt sha and replay-pieces digest equal the pinned receipt's own, for this host's input shard;
+- after the restore, the save carries NO fast-cursor identity (a save a patched run wrote uses its own sidecar, never
+  a replay-derived one), and the restored step, batch count and shard equal the cursor's.
+The identity check for saves written by a patched run is unchanged.
+
 Installed into MaxText as src/maxtext/input_pipeline/fast_cursor.py by experiments/fast_cursor/fast_cursor.patch;
 tests/test_fast_cursor.py pins that copy to this file.
 """
@@ -35,6 +47,23 @@ METADATA_KEY = "fast_cursor_id"
 MARGIN = 4  # batches: covers the packer's final flush, which holds at most one batch of rows; the minimum allowed
 FIELDS = ("step", "batches", "host", "raw_rows_consumed", "identity", "shard_index", "shard_count", "receipt_sha256",
           "rows_per_batch", "grad_accum")
+REPLAY_FIELDS = FIELDS + ("replay_pieces_sha256",)  # a replay-derived cursor's fields
+REPLAY_PREFIX = "replay:"
+
+
+def is_replay(cursor):
+  ident = cursor.get("identity") if isinstance(cursor, dict) else None
+  return isinstance(ident, str) and ident.startswith(REPLAY_PREFIX)
+
+
+def _fields(cursor):
+  return REPLAY_FIELDS if is_replay(cursor) else FIELDS
+
+
+def replay_pieces_digest(pieces):
+  """sha256 over a receipt's list of one host's replay pieces (file name and sha256 of each, in order)."""
+  body = json.dumps([[p["file"], p["sha256"]] for p in pieces])
+  return hashlib.sha256(body.encode()).hexdigest()
 
 
 def _int(v):
@@ -69,7 +98,22 @@ def pin_from_env(env, read_bytes, log=print):
     if margin is None or margin < MARGIN:
       log(f"FAST-CURSOR: margin {margin_text!r} is not an integer >= {MARGIN}")
       return None
-    return {"receipt_sha256": got, "ends": ends, "margin": margin}
+    # Replay-derived cursors: the receipt's replay pieces per host, and the sidecar shas the launcher pins.
+    replay_pieces = {h["host"]: replay_pieces_digest(h["replay_pieces"]) for h in receipt["hosts"]
+                     if h.get("replay_pieces")}
+    replay_pins = {}
+    text = env.get("MAXTEXT_FAST_CURSOR_REPLAY_SHA256", "").strip()
+    if text:
+      try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and all(isinstance(v, str) and len(v) == 64 for v in parsed.values()):
+          replay_pins = {int(k): v for k, v in parsed.items()}
+        else:
+          log("FAST-CURSOR: MAXTEXT_FAST_CURSOR_REPLAY_SHA256 is not an object of process index to sha256; ignored")
+      except ValueError as e:
+        log(f"FAST-CURSOR: MAXTEXT_FAST_CURSOR_REPLAY_SHA256 unreadable ({e!r}); ignored")
+    return {"receipt_sha256": got, "ends": ends, "margin": margin, "replay_pieces": replay_pieces,
+            "replay_pins": replay_pins}
   except Exception as e:  # pylint: disable=broad-except
     log(f"FAST-CURSOR: no usable pinned receipt ({e!r})")
     return None
@@ -105,7 +149,7 @@ def _path(state_dir, step, host):
 
 
 def encode(cursor):
-  body = json.dumps({k: cursor[k] for k in FIELDS}, sort_keys=True)
+  body = json.dumps({k: cursor[k] for k in _fields(cursor)}, sort_keys=True)
   return json.dumps({"cursor": json.loads(body), "sha256": hashlib.sha256(body.encode()).hexdigest()},
                     sort_keys=True).encode()
 
@@ -128,11 +172,15 @@ def write(state_dir, cursor):
 
 def _check(obj, step, host, grad_accum, pin, config):
   c, sha = obj["cursor"], obj["sha256"]
-  body = json.dumps({k: c[k] for k in FIELDS}, sort_keys=True)
-  if hashlib.sha256(body.encode()).hexdigest() != sha or set(c) != set(FIELDS):
+  fields = _fields(c)
+  if set(c) != set(fields):
     return "sha or fields do not match"
-  if not all(_int(c[k]) and c[k] >= 0 for k in FIELDS if k not in ("identity", "receipt_sha256")) or not (
-      isinstance(c["identity"], str) and isinstance(c["receipt_sha256"], str)):
+  body = json.dumps({k: c[k] for k in fields}, sort_keys=True)
+  if hashlib.sha256(body.encode()).hexdigest() != sha:
+    return "sha or fields do not match"
+  texts = ("identity", "receipt_sha256", "replay_pieces_sha256")
+  if not all(_int(c[k]) and c[k] >= 0 for k in fields if k not in texts) or not all(
+      isinstance(c[k], str) for k in fields if k in texts):
     return "malformed field"
   if c["step"] != step or c["host"] != host:
     return f"names step {c['step']} host {c['host']}"
@@ -144,6 +192,13 @@ def _check(obj, step, host, grad_accum, pin, config):
     return f"was written under receipt {c['receipt_sha256'][:12]}, this run pins {pin['receipt_sha256'][:12]}"
   if (c["rows_per_batch"], c["grad_accum"]) != (config["rows_per_batch"], config["grad_accum"]):
     return f"loader config {c['rows_per_batch']} rows x GA {c['grad_accum']} != this run's {config}"
+  if is_replay(c):
+    if c["identity"] != f"{REPLAY_PREFIX}{step}":
+      return f"replay-derived cursor names {c['identity']!r}, not {REPLAY_PREFIX}{step}"
+    if pin.get("replay_pins", {}).get(host) != sha:
+      return "replay-derived cursor is not the one the launcher pins for this host"
+    if c["replay_pieces_sha256"] != pin.get("replay_pieces", {}).get(c["shard_index"]):
+      return "replay-derived cursor was not computed from the pinned receipt's replay pieces for this shard"
   return None
 
 
@@ -176,11 +231,14 @@ def candidate(checkpoint_dir, state_dir, host, grad_accum, pin, config, log=prin
 def verify_restored(cursor, restored_step, restored_batches, restored_metadata, shard_index, shard_count):
   """None if Tunix restored exactly the save the cursor belongs to, on this host's recorded shard; else the reason."""
   got = (restored_metadata or {}).get(METADATA_KEY)
+  if is_replay(cursor) and got is not None:
+    return (f"the save carries fast-cursor identity {got!r}: a replay-derived cursor is only for a save written "
+            "without one")
   if restored_step != cursor["step"]:
     return f"Tunix restored step {restored_step}, the cursor is for {cursor['step']}"
   if restored_batches != cursor["batches"]:
     return f"Tunix is at batch {restored_batches}, the cursor at {cursor['batches']}"
-  if got != cursor["identity"]:
+  if not is_replay(cursor) and got != cursor["identity"]:
     return f"checkpoint identity {got!r} != the cursor's {cursor['identity']!r} (a sidecar from another attempt)"
   if (shard_index, shard_count) != (cursor["shard_index"], cursor["shard_count"]):
     return f"input shard {shard_index}/{shard_count} != recorded {cursor['shard_index']}/{cursor['shard_count']}"
