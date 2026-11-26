@@ -30,11 +30,14 @@ in its metadata, so the reader above can never use it. For such a save a cursor 
 stream's pinned replay (derive_cursor.py: the host's cumulative documents consumed at step S). It is a second,
 explicit kind: its identity is "replay:<S>", and it carries one more field, the digest of the replay pieces it was
 computed from. It is accepted only when all of these hold; otherwise the host falls back as above:
-- the launcher pins this host's sidecar sha256 (MAXTEXT_FAST_CURSOR_REPLAY_SHA256, a JSON object of process index to
-  sha256), and the object read has that sha;
+- the launcher pins this host's cursor sha256 (MAXTEXT_FAST_CURSOR_REPLAY_SHA256, a JSON object of process index to
+  sha256), and the object read has that sha. The pin is the sidecar's own "sha256" field: the hash of the cursor as
+  canonical JSON (its fields, keys sorted), which the reader recomputes from the fields it uses. It is not a hash of
+  the file's bytes, so formatting outside the cursor is not covered and does not matter;
 - its receipt sha and replay-pieces digest equal the pinned receipt's own, for this host's input shard;
-- after the restore, the save carries NO fast-cursor identity (a save a patched run wrote uses its own sidecar, never
-  a replay-derived one), and the restored step, batch count and shard equal the cursor's.
+- after the restore, the save's metadata has NO fast-cursor identity key, whatever its value, null included (a save
+  a patched run wrote uses its own sidecar, never a replay-derived one), and the restored step, batch count and
+  shard equal the cursor's.
 The identity check for saves written by a patched run is unchanged.
 
 Installed into MaxText as src/maxtext/input_pipeline/fast_cursor.py by experiments/fast_cursor/fast_cursor.patch;
@@ -120,6 +123,9 @@ def pin_from_env(env, read_bytes, log=print):
 
 
 def loader_config(global_batch, process_count, grad_accum):
+  """`global_batch` is the batch the loader LOADS per update (config.global_batch_size_to_load), not the batch trained
+  on: each process loads global_batch // process_count rows. With per_device_batch_size < 1 the two differ (H267:
+  512 loaded and 16 trained on 128 processes, so 4 rows per process; 16 // 128 would be 0)."""
   return {"rows_per_batch": int(global_batch) // int(process_count), "grad_accum": max(int(grad_accum or 1), 1)}
 
 
@@ -231,7 +237,7 @@ def candidate(checkpoint_dir, state_dir, host, grad_accum, pin, config, log=prin
 def verify_restored(cursor, restored_step, restored_batches, restored_metadata, shard_index, shard_count):
   """None if Tunix restored exactly the save the cursor belongs to, on this host's recorded shard; else the reason."""
   got = (restored_metadata or {}).get(METADATA_KEY)
-  if is_replay(cursor) and got is not None:
+  if is_replay(cursor) and METADATA_KEY in (restored_metadata or {}):
     return (f"the save carries fast-cursor identity {got!r}: a replay-derived cursor is only for a save written "
             "without one")
   if restored_step != cursor["step"]:

@@ -111,7 +111,7 @@ def _install_data_state_save_hook(mt_config):
   if getattr(orig, "_fast_cursor", False):
     return
   ga = max(int(mt_config.gradient_accumulation_steps or 1), 1)
-  loader = fast_cursor.loader_config(mt_config.global_batch_size_to_train_on, jax.process_count(), ga)
+  loader = fast_cursor.loader_config(mt_config.global_batch_size_to_load, jax.process_count(), ga)
   nonce = int(multihost_utils.broadcast_one_to_all(np.int32(int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF)))
 
   def save(self, step, *args, custom_metadata=None, **kwargs):

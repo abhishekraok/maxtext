@@ -268,7 +268,7 @@ class BaseDataHooks(DataHooks):
       from maxtext.input_pipeline import fast_cursor  # pylint: disable=import-outside-toplevel
 
       ga = max(int(getattr(config, "gradient_accumulation_steps", 1) or 1), 1)
-      loader = fast_cursor.loader_config(config.global_batch_size_to_train_on, jax.process_count(), ga)
+      loader = fast_cursor.loader_config(config.global_batch_size_to_load, jax.process_count(), ga)
       self._fast_cursor = multihost_dataloading.read_data_state_for_resume(
           getattr(config, "checkpoint_dir", ""), ga, loader)
       if self._fast_cursor:
