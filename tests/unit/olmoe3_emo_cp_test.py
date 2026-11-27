@@ -310,9 +310,7 @@ class EmoContextParallelTest(unittest.TestCase):
       def mask_rows(x, seg, key):
         return olmoe3.OLMoE3LatentRoutedMoE._emo_mask_logits(router, x, seg, key)  # pylint: disable=protected-access
 
-      sharded_mask = jax.shard_map(
-          mask_rows, mesh=mesh, in_specs=(batch, sequence, P()), out_specs=batch, check_vma=True
-      )
+      sharded_mask = jax.shard_map(mask_rows, mesh=mesh, in_specs=(batch, sequence, P()), out_specs=batch, check_vma=True)
 
       @jax.jit
       def run(x, seg, restored_key, step):

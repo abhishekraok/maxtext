@@ -6678,9 +6678,7 @@ class MaxTextConfig(
         or self.using_pipeline_parallelism
         or self.enable_diloco
     ):
-      raise ValueError(
-          "emo_resample_per_step requires OLMoE3 EMo with sparse all-to-all routing and one batch per step."
-      )
+      raise ValueError("emo_resample_per_step requires OLMoE3 EMo with sparse all-to-all routing and one batch per step.")
     self.validate_num_moe_emb_chunks()
     self.validate_moe_quantize_token_all_gather()
     self.validate_moe_topk_before_ep_all_gather()
