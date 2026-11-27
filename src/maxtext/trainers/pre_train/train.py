@@ -817,12 +817,20 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       nnx.update(state.model, curr_params)
 
     static_cotangent = _static_loss_cotangent(config, True)
+    emo_step = None
+    if getattr(config, "emo_resample_per_step", False) and len(config.emo_document_expert_pool_choices) != 1:
+      # NNX advances this counter on skipped optimizer updates too. The checkpoint restores it on resume.
+      emo_step = state.optimizer.step.get_value()
 
     def diff_wrapper(curr_params, custom_params, rest, config, data):
       if config.cast_params_to_compute_dtype:
         curr_params = _cast_params_for_compute(curr_params, config.dtype)
       local_model = nnx.merge(model_graphdef, curr_params, custom_params, rest, copy=True)
-      loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
+      emo_token = moe.EMO_TRAIN_STEP.set(emo_step)
+      try:
+        loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
+      finally:
+        moe.EMO_TRAIN_STEP.reset(emo_token)
       if static_cotangent:
         # loss_fn returned the unnormalized objective (the token-loss sum, aux losses weighted by the divisor), as
         # under manual GA; a static power-of-two scale keeps the backward's cotangent exact in bf16.

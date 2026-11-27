@@ -24,6 +24,7 @@ and gradients when the sequence axis is sharded across context-parallel devices 
   segment IDs separated by another document within a shard, and ``segment_ids=None``
 - Training-mode random pool sampling: shared pool size across all CP shards of a document
   and independent draws for distinct documents starting at the same local shard offset
+- Per-step sampling: draws vary with the update and batch shard, and replay from a saved key and step
 - End-to-end ``OLMoE3LatentRoutedMoE.sparse_matmul`` across ``(CP=1, EP=4)``, ``(CP=2, EP=2)``,
   and ``(CP=4, EP=1)`` under ``custom_mesh_and_rule="cp-as-ep"`` with
   ``moe_a2a_expert_major=True`` (``moe_a2a_token_chunks=1`` and ``2``), plus direct verification
@@ -289,6 +290,84 @@ class EmoContextParallelTest(unittest.TestCase):
     finally:
       moe.SEQ_SHARD_AXES.reset(token)
     self.assertIn(True, distinct_draws, "documents at local offset 0 on different CP shards should draw independently")
+
+  def test_step_sampled_pools_replay_and_vary_across_data_shards(self):
+    """Replay a saved step, with independent data shards and one pool per packed document."""
+    mesh = Mesh(self.devices.reshape(2, 2), ("data", "context"))
+    batch, sequence = P("data", "context", None), P("data", "context")
+    # Give both data shards identical rows and document starts. Without a data-axis fold,
+    # every pool on one shard would be replicated on the other.
+    logits = jnp.concatenate((self.logits[:2], self.logits[:2]), axis=0)
+    segments = jnp.concatenate((self.segments[:2], self.segments[:2]), axis=0)
+    choices, probs = (2, 4, 8, 16), (0.125, 0.125, 0.125, 0.625)
+    saved_layer_key = jax.random.key(63, impl="unsafe_rbg")
+
+    def make_run(*, resample, pool_choices=choices, pool_probs=probs, call_mode="train"):
+      router = _make_router(
+          mesh, causal=True, lean=True, bisect=True, choices=pool_choices, probs=pool_probs, call_mode=call_mode
+      )
+
+      def mask_rows(x, seg, key):
+        return olmoe3.OLMoE3LatentRoutedMoE._emo_mask_logits(router, x, seg, key)  # pylint: disable=protected-access
+
+      sharded_mask = jax.shard_map(
+          mask_rows, mesh=mesh, in_specs=(batch, sequence, P()), out_specs=batch, check_vma=True
+      )
+
+      @jax.jit
+      def run(x, seg, restored_key, step):
+        rngs = nnx.Rngs(params=restored_key)
+        step_token = moe.EMO_TRAIN_STEP.set(step if resample and len(pool_choices) != 1 else None)
+        try:
+          routing_rng, batch_axes = moe._emo_routing_rng(rngs, mesh, batch, None)  # pylint: disable=protected-access
+        finally:
+          moe.EMO_TRAIN_STEP.reset(step_token)
+        # The legacy branch passes the stream to routing, which draws from it.
+        # Draw its raw key explicitly for this shard_map, which only accepts arrays.
+        key = routing_rng.params() if isinstance(routing_rng, nnx.Rngs) else routing_rng
+        seq_token = moe.SEQ_SHARD_AXES.set(("context",))
+        batch_token = moe.EMO_BATCH_SHARD_AXES.set(batch_axes)
+        try:
+          return jnp.isfinite(sharded_mask(x, seg, key))
+        finally:
+          moe.EMO_BATCH_SHARD_AXES.reset(batch_token)
+          moe.SEQ_SHARD_AXES.reset(seq_token)
+
+      return run
+
+    run = make_run(resample=True)
+    steps = (7, 8, 9, 10)
+    masks = np.stack([run(logits, segments, saved_layer_key, step) for step in steps])
+    pools = masks.sum(axis=-1)
+    self.assertTrue(np.isin(pools, choices).all())
+    self.assertTrue(np.any(pools[1:] != pools[:-1]), "pool draws must vary between steps with the same batch")
+    self.assertTrue(np.any(pools[:, :2] != pools[:, 2:]), "identical data shards must have distinct pool streams")
+    # Row 0 spans both CP shards. Row 1's third document starts at position 14 and
+    # crosses into the second CP shard; its continuation must inherit the pool.
+    for row, spans in ((0, ((0, 32),)), (1, ((0, 12), (12, 14), (14, 29), (29, 32)))):
+      for start, end in spans:
+        document_pools = pools[:, row::2, start:end]
+        np.testing.assert_array_equal(document_pools, np.repeat(document_pools[..., :1], end - start, axis=-1))
+
+    # A fresh callable replays a later step directly from the same saved key and
+    # restored step, without first drawing the skipped earlier steps.
+    resumed = make_run(resample=True)
+    np.testing.assert_array_equal(resumed(logits, segments, saved_layer_key, steps[2]), masks[2])
+
+    legacy = make_run(resample=False)
+    legacy_mask = np.asarray(legacy(logits, segments, saved_layer_key, steps[0]))
+    np.testing.assert_array_equal(legacy(logits, segments, saved_layer_key, steps[1]), legacy_mask)
+    np.testing.assert_array_equal(legacy_mask[:2], legacy_mask[2:])
+
+    fixed = make_run(resample=True, pool_choices=(8,), pool_probs=(1.0,))
+    fixed_mask = fixed(logits, segments, saved_layer_key, steps[0])
+    np.testing.assert_array_equal(fixed_mask.sum(axis=-1), 8)
+    np.testing.assert_array_equal(fixed(logits, segments, saved_layer_key, steps[1]), fixed_mask)
+
+    inference = make_run(resample=True, call_mode="inference")
+    eval_mask = inference(logits, segments, saved_layer_key, steps[0])
+    np.testing.assert_array_equal(eval_mask.sum(axis=-1), 4)
+    np.testing.assert_array_equal(inference(logits, segments, saved_layer_key, steps[1]), eval_mask)
 
   def test_ep_gathered_cp_as_ep_unfolding_matches_cp1(self):
     """When roe_ag_and_route gathers ('context', 'expert') onto axis 0, unfolding reproduces CP=1 identically."""

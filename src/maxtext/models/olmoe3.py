@@ -1817,6 +1817,9 @@ class OLMoE3LatentRoutedMoE(moe.RoutedMoE):
     sample_pools = rngs is not None and cfg.model_call_mode != "inference" and not _EMO_EVAL_POOLS.get()
     if sample_pools:
       rng = rngs.params() if hasattr(rngs, "params") and callable(getattr(rngs, "params")) else rngs
+      batch_axes = moe.EMO_BATCH_SHARD_AXES.get()
+      if batch_axes:
+        rng = jax.random.fold_in(rng, jax.lax.axis_index(batch_axes))
       if cp_size > 1:
         rng = jax.random.fold_in(rng, cp_idx)
       if cfg.emo_document_expert_pool_choices:

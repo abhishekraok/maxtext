@@ -312,6 +312,8 @@ load_balance_loss_weight: 0.0 # weight for the load balance loss
 # EMo document-pool routing (OLMoE3): restrict each document's top-k to a per-document
 # expert pool (size sampled from [min, max] in training, fixed at eval). arxiv 2605.06663
 emo_enabled: false
+# Derive each layer's pool draws from the checkpointed training step and batch shard.
+emo_resample_per_step: false
 emo_min_document_expert_pool: 16
 emo_max_document_expert_pool: 512
 emo_eval_document_expert_pool: 512
