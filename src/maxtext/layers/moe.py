@@ -82,6 +82,12 @@ PROBE_TOKEN_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_probe_tok
 # set around that call; () outside the shard_map or when sequence is unsharded.
 SEQ_SHARD_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_seq_shard_axes", default=())
 
+# A traced step supplied only by the pre-training forward when EMo per-step sampling is enabled.
+EMO_TRAIN_STEP: contextvars.ContextVar = contextvars.ContextVar("moe_emo_train_step", default=None)
+# The batch dimensions of the sparse router, inside the shard_map with per-step sampling.
+EMO_BATCH_SHARD_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_emo_batch_shard_axes", default=())
+
+
 # Mesh axes all-gathered onto axis 0 of gate_logits inside roe_ag_and_route before permute() (e.g. ("context",
 # "expert") under cp-as-ep); () when gate_logits still has its shard_map layout.
 EP_GATHERED_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_ep_gathered_axes", default=())
@@ -89,6 +95,25 @@ EP_GATHERED_AXES: contextvars.ContextVar = contextvars.ContextVar("moe_ep_gather
 # A traced boolean, set around a train step's forward pass when the router load-imbalance metrics are computed on some
 # steps only (olmoe3_router_metrics_interval): a model computes them under lax.cond on it. None computes them always.
 ROUTER_IMBALANCE_ON: contextvars.ContextVar = contextvars.ContextVar("moe_router_imbalance_on", default=None)
+
+
+def _emo_routing_rng(rngs, mesh, gate_logits_pspec, forced_routed_experts):
+  """Choose the replicated per-layer key and the mesh axes that distinguish batch rows."""
+  step = EMO_TRAIN_STEP.get()
+  if step is None or rngs is None or forced_routed_experts is not None:
+    return rngs, ()
+  batch_axes = ()
+  if gate_logits_pspec is not None and gate_logits_pspec[0] is not None:
+    batch_axes = tuple(ax for ax in mesh_axes_for_dim(gate_logits_pspec[0]) if mesh.shape[ax] > 1)
+  layer_key = rngs.params.key[...]
+  # unsafe_rbg combines folds with XOR, so swapping step and shard would reuse a key.
+  # rbg keeps the same four seed words and uses XLA generation with ordered Threefry key derivation.
+  if layer_key.dtype == jax.random.key_dtype("unsafe_rbg"):
+    layer_key = jax.random.wrap_key_data(jax.random.key_data(layer_key), dtype="rbg")
+  # Separate pool draws from parameter initialization, which folds its own counter into the layer key.
+  pool_key = jax.random.fold_in(layer_key, 0x454D4F)  # "EMO" in ASCII
+  # The shard_map accepts a replicated key. NNX counter writes inside it do not reach the model.
+  return jax.random.fold_in(pool_key, step), batch_axes
 
 
 set_xla_metadata = xla_metadata.set_xla_metadata
@@ -4977,6 +5002,8 @@ class RoutedMoE(nnx.Module):
         else ()
     )
     seq_shard_axes = tuple(ax for ax in raw_seq_axes if self.mesh.shape[ax] > 1)
+    routing_rng, batch_shard_axes = _emo_routing_rng(self.rngs, self.mesh, gate_logits_pspec, forced_routed_experts)
+    emo_batch_token = EMO_BATCH_SHARD_AXES.set(batch_shard_axes)
     lb_axes_token = LB_REDUCE_AXES.set(overflow_mesh_axes)
     probe_axes_token = PROBE_TOKEN_AXES.set(tuple(bias_update_axis_names or ()))
     seq_axes_token = SEQ_SHARD_AXES.set(seq_shard_axes)
@@ -4992,11 +5019,12 @@ class RoutedMoE(nnx.Module):
           w1_bias,
           wo_bias,
           input_ids,
-          self.rngs,
+          routing_rng,
           forced_routed_experts,
           per_expert_scale,
       )
     finally:
+      EMO_BATCH_SHARD_AXES.reset(emo_batch_token)
       SEQ_SHARD_AXES.reset(seq_axes_token)
       LB_REDUCE_AXES.reset(lb_axes_token)
       PROBE_TOKEN_AXES.reset(probe_axes_token)

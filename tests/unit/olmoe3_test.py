@@ -484,6 +484,18 @@ class OLMoE3RoutingTest(unittest.TestCase):
       with mesh, self.assertRaises(ValueError):
         OLMoE3DecoderLayer(cfg, mesh, MODEL_MODE_TRAIN, layer_idx=1, rngs=nnx.Rngs(params=0))
 
+  def test_emo_resampling_requires_supported_sparse_training_config(self):
+    settings = ("override_model_config=True", "emo_resample_per_step=True", "sparse_matmul=True")
+    self.assertTrue(_config("olmoe3-30m", extra=settings).emo_resample_per_step)
+    for extra in (
+        ("emo_enabled=False",),
+        ("sparse_matmul=False",),
+        ("ici_expert_parallelism=2", "use_ring_of_experts=True"),
+        ("gradient_accumulation_steps=2",),
+    ):
+      with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, "emo_resample_per_step requires"):
+        _config("olmoe3-30m", extra=(*settings, *extra))
+
   def test_emo_threshold_keep_matches_double_argsort(self):
     """The one-sort EMo mask equals ``argsort(argsort(-s)) < pool``, ties included."""
     # pylint: disable=g-import-not-at-top,import-outside-toplevel

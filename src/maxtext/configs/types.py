@@ -1424,6 +1424,10 @@ class MoEGeneral(BaseModel):
       False,
       description="EMo document-pool routing (OLMoE3): restrict each packed document's top-k to a per-document expert pool.",
   )
+  emo_resample_per_step: bool = Field(
+      False,
+      description="Derive OLMoE3 EMo pool draws from the training step, layer, and batch shard.",
+  )
   emo_min_document_expert_pool: int = Field(
       16, description="Smallest EMo training pool size (must be >= num_experts_per_tok)."
   )
@@ -6664,6 +6668,17 @@ class MaxTextConfig(
       self.validate_moe_dropless_fallback()
       self.validate_moe_log_max_load_ratio()
       self.validate_moe_tc_ragged_sort()
+    if self.emo_resample_per_step and (
+        self.decoder_block != DecoderBlockType.OLMOE3
+        or not self.emo_enabled
+        or not self.sparse_matmul
+        or self.use_ring_of_experts
+        or self.te_moe_block
+        or self.gradient_accumulation_steps != 1
+        or self.using_pipeline_parallelism
+        or self.enable_diloco
+    ):
+      raise ValueError("emo_resample_per_step requires OLMoE3 EMo with sparse all-to-all routing and one batch per step.")
     self.validate_num_moe_emb_chunks()
     self.validate_moe_quantize_token_all_gather()
     self.validate_moe_topk_before_ep_all_gather()

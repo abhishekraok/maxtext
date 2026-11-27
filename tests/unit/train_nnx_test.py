@@ -82,6 +82,8 @@ class _Cfg:
   norm_metrics: str = "all"
   olmoe3_router_metrics: bool = False
   olmoe3_router_metrics_interval: int = 0
+  emo_resample_per_step: bool = False
+  emo_document_expert_pool_choices: tuple = ()
   load_balance_loss_weight: float = 0.01
   first_num_dense_layers: int = 1
   inhomogeneous_layer_cycle_interval: int = 1
@@ -115,6 +117,25 @@ class _TinyDecoder(nnx.Module):
     del enable_dropout, decoder_target_tokens, decoder_target_mask
     h = self.embed(decoder_input_tokens)
     return self.proj(h)
+
+
+class _TinyDecoderEmoRoutingKey(_TinyDecoder):
+  """Record the real sparse router's input key in non-parameter model state."""
+
+  def __init__(self, vocab_size, hidden, rngs):
+    super().__init__(vocab_size, hidden, rngs)
+    self.routing_rng = nnx.Rngs(params=jax.random.key(42, impl="unsafe_rbg"))
+    self.emo_key = nnx.Variable(jax.random.key_data(self.routing_rng.params.key[...]))
+    self.emo_step = nnx.Variable(jnp.asarray(-1, dtype=jnp.int32))
+
+  def __call__(self, *args, **kwargs):
+    step = moe.EMO_TRAIN_STEP.get()
+    self.emo_step[...] = -1 if step is None else step
+    key, _ = moe._emo_routing_rng(self.routing_rng, self.mesh, None, None)  # pylint: disable=protected-access
+    if isinstance(key, nnx.Rngs):
+      key = key.params.key[...]
+    self.emo_key[...] = jax.random.key_data(key)
+    return super().__call__(*args, **kwargs)
 
 
 _OVERWRITE_WITH_GRADIENT = variablelib.variable_type_from_name("_overwrite_with_gradient", allow_register=True)
@@ -468,6 +489,32 @@ class TestTrainStepNNX(unittest.TestCase):
         state_graphdef, cfg, state_mesh_shardings=None, params_shardings=None, state=state_pure, data=data
     )
     self.assertEqual(int(new_state.optimizer.step.get_value()), pre_step + 1)
+
+  def test_train_step_supplies_restored_optimizer_step_to_emo_router(self):
+    """Only opt-in sampled training changes the router key from one optimizer step to the next."""
+    for enabled, choices, changes in ((True, (2, 4, 8), True), (False, (2, 4, 8), False), (True, (4,), False)):
+      with self.subTest(enabled=enabled, choices=choices):
+        cfg = _Cfg(emo_resample_per_step=enabled, emo_document_expert_pool_choices=choices)
+        model = _TinyDecoderEmoRoutingKey(cfg.vocab_size, hidden=4, rngs=nnx.Rngs(0))
+        optimizer = nnx.Optimizer(model, optax.sgd(0.01), wrt=nnx.Param)
+        graph, state = nnx.split(train_state_nnx.TrainStateNNX(model, optimizer))
+        batch = _make_data(batch=cfg.micro_batch_size_to_train_on, vocab=cfg.vocab_size)
+        run_step = jax.jit(functools.partial(pre_train.train_step, graph, cfg, None, None))
+
+        checkpoint, _ = run_step(state, batch)
+        next_state, _ = run_step(checkpoint, batch)
+        self.assertEqual(int(checkpoint.optimizer.step.get_value()), 1)
+        self.assertEqual(int(next_state.optimizer.step.get_value()), 2)
+        self.assertEqual(int(checkpoint.model.emo_step[...]), 0 if changes else -1)
+        self.assertEqual(int(next_state.model.emo_step[...]), 1 if changes else -1)
+        key_before = checkpoint.model.emo_key[...]
+        key_after = next_state.model.emo_key[...]
+        self.assertEqual(not np.array_equal(key_before, key_after), changes)
+        self.assertIsNone(moe.EMO_TRAIN_STEP.get())
+
+        replay_step = jax.jit(functools.partial(pre_train.train_step, graph, cfg, None, None))
+        replay, _ = replay_step(checkpoint, batch)
+        np.testing.assert_array_equal(replay.model.emo_key[...], key_after)
 
   def test_router_metrics_interval(self):
     """olmoe3_router_metrics_interval=2: steps 0 and 2 log the load imbalance, step 1 doesn't; the losses every step.
