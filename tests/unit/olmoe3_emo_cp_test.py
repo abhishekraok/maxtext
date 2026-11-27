@@ -369,6 +369,50 @@ class EmoContextParallelTest(unittest.TestCase):
     np.testing.assert_array_equal(eval_mask.sum(axis=-1), 4)
     np.testing.assert_array_equal(inference(logits, segments, saved_layer_key, steps[1]), eval_mask)
 
+  def test_effective_pool_keys_distinguish_swapped_step_and_shard_coordinates(self):
+    """Exact key grid catches XOR aliases even when draws vary along each axis."""
+    mesh = Mesh(self.devices.reshape(2, 2), ("data", "context"))
+    batch, sequence = P("data", "context", None), P("data", "context")
+    router = _make_router(mesh, causal=True, choices=(2, 4, 8, 16), probs=(0.125, 0.125, 0.125, 0.625))
+    original_choice = jax.random.choice
+
+    def read_sampler_key(logits, segments, key):
+      seen = []
+
+      def record_key(effective_key, *args, **kwargs):
+        seen.append(jax.random.key_data(effective_key))
+        return original_choice(effective_key, *args, **kwargs)
+
+      with mock.patch.object(jax.random, "choice", record_key):
+        olmoe3.OLMoE3LatentRoutedMoE._emo_mask_logits(router, logits, segments, key)  # pylint: disable=protected-access
+      (words,) = seen
+      return words[None, None, :]
+
+    mapper = jax.shard_map(read_sampler_key, mesh=mesh, in_specs=(batch, sequence, P()), out_specs=batch)
+
+    @jax.jit
+    def keys_at_step(layer_key, step, logits, segments):
+      step_token = moe.EMO_TRAIN_STEP.set(step)
+      seq_token = moe.SEQ_SHARD_AXES.set(("context",))
+      try:
+        key, axes = moe._emo_routing_rng(nnx.Rngs(params=layer_key), mesh, batch, None)  # pylint: disable=protected-access
+        batch_token = moe.EMO_BATCH_SHARD_AXES.set(axes)
+        try:
+          return mapper(logits, segments, key)
+        finally:
+          moe.EMO_BATCH_SHARD_AXES.reset(batch_token)
+      finally:
+        moe.SEQ_SHARD_AXES.reset(seq_token)
+        moe.EMO_TRAIN_STEP.reset(step_token)
+
+    for impl in ("threefry2x32", "unsafe_rbg"):
+      with self.subTest(impl=impl):
+        layer_key = jax.random.key(63, dtype=impl)
+        first, second = [np.asarray(keys_at_step(layer_key, step, self.logits, self.segments)) for step in (0, 1)]
+        all_keys = np.stack((first, second))
+        np.testing.assert_array_equal(keys_at_step(layer_key, 1, self.logits, self.segments), second)
+        self.assertEqual(np.unique(all_keys.reshape(8, -1), axis=0).shape[0], 8)
+
   def test_ep_gathered_cp_as_ep_unfolding_matches_cp1(self):
     """When roe_ag_and_route gathers ('context', 'expert') onto axis 0, unfolding reproduces CP=1 identically."""
     mesh = self.mesh_cp2_ep2

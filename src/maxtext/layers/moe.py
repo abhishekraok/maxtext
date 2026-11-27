@@ -105,8 +105,13 @@ def _emo_routing_rng(rngs, mesh, gate_logits_pspec, forced_routed_experts):
   batch_axes = ()
   if gate_logits_pspec is not None and gate_logits_pspec[0] is not None:
     batch_axes = tuple(ax for ax in mesh_axes_for_dim(gate_logits_pspec[0]) if mesh.shape[ax] > 1)
-  # Separate pool draws from parameter initialization, which folds its own counter into this layer key.
-  pool_key = jax.random.fold_in(rngs.params.key[...], 0x454D4F)  # "EMO" in ASCII
+  layer_key = rngs.params.key[...]
+  # unsafe_rbg combines folds with XOR, so swapping step and shard would reuse a key.
+  # rbg keeps the same four seed words and uses XLA generation with ordered Threefry key derivation.
+  if layer_key.dtype == jax.random.key_dtype("unsafe_rbg"):
+    layer_key = jax.random.wrap_key_data(jax.random.key_data(layer_key), dtype="rbg")
+  # Separate pool draws from parameter initialization, which folds its own counter into the layer key.
+  pool_key = jax.random.fold_in(layer_key, 0x454D4F)  # "EMO" in ASCII
   # The shard_map accepts a replicated key. NNX counter writes inside it do not reach the model.
   return jax.random.fold_in(pool_key, step), batch_axes
 
